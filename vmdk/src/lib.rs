@@ -256,4 +256,29 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<VmdkReader>();
     }
+
+    // ── Property tests: open() never panics on arbitrary input ────────────────
+
+    proptest::proptest! {
+        #[test]
+        fn open_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..8192)
+        ) {
+            let f = write_tmp(&bytes);
+            let _ = VmdkReader::open(f.path());
+        }
+
+        #[test]
+        fn open_never_panics_on_valid_magic_plus_garbage(
+            suffix in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..8192)
+        ) {
+            // Correct magic + version 1 prefix — exercises field parsing with random data.
+            let mut bytes = vec![0u8; 8];
+            bytes[0..4].copy_from_slice(&0x564D_444B_u32.to_le_bytes());
+            bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&suffix);
+            let f = write_tmp(&bytes);
+            let _ = VmdkReader::open(f.path());
+        }
+    }
 }
