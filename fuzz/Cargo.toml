@@ -4,6 +4,11 @@ version = "0.0.0"
 publish = false
 edition = "2021"
 
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
 [[bin]]
 name  = "fuzz_open"
 path  = "fuzz_targets/fuzz_open.rs"
@@ -12,5 +17,5 @@ doc   = false
 
 [dependencies]
 libfuzzer-sys = "0.4"
-vmdk          = { path = ".." }
+vmdk          = { path = "../vmdk" }
 tempfile      = "3"

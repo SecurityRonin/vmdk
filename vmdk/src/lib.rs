@@ -50,6 +50,10 @@ impl VmdkReader {
         let gd_byte_len = num_gts.checked_mul(4)
             .ok_or_else(|| VmdkError::InvalidGeometry("gd_byte_len overflow".into()))?;
 
+        const MAX_GD_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB — prevents OOM on crafted images
+        if gd_byte_len > MAX_GD_BYTES {
+            return Err(VmdkError::InvalidGeometry("grain directory too large".into()));
+        }
         let gd_sector_offset = hdr.gd_offset.checked_mul(SECTOR_SIZE)
             .ok_or_else(|| VmdkError::InvalidGeometry("gd_offset overflow".into()))?;
         file.seek(SeekFrom::Start(gd_sector_offset))?;
