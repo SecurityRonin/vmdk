@@ -6,7 +6,10 @@
 
 **Pure-Rust read-only VMware VMDK sparse disk image reader.**
 
-Decodes monolithic sparse VMDK containers (VMware Workstation, Fusion, and ESXi exported images) and exposes a `Read + Seek` interface over the virtual sector stream. Navigates the two-level grain directory / grain table structure to resolve virtual offsets to raw grain data. Zero unsafe code, no C bindings.
+Decodes monolithic sparse VMDK containers (VMware Workstation, Fusion, and ESXi-exported images)
+and exposes a `Read + Seek` interface over the virtual sector stream. Navigates the two-level
+grain directory / grain table structure to resolve virtual offsets to raw grain data.
+Zero unsafe code, no C bindings.
 
 ```toml
 [dependencies]
@@ -17,7 +20,7 @@ vmdk = "0.1"
 
 ## Usage
 
-### Open a VMDK and read sectors
+### Library
 
 ```rust
 use vmdk::VmdkReader;
@@ -27,8 +30,8 @@ use std::io::{Read, Seek, SeekFrom};
 let file = File::open("disk.vmdk")?;
 let mut reader = VmdkReader::open(file)?;
 
-println!("Virtual disk size: {} bytes", reader.virtual_disk_size());
-println!("Disk type: {}", reader.disk_type()); // e.g. "monolithicSparse"
+println!("Disk type:         {}", reader.disk_type());        // "monolithicSparse"
+println!("Virtual disk size: {}", reader.virtual_disk_size()); // bytes
 
 // Read the first sector
 let mut sector = [0u8; 512];
@@ -38,32 +41,64 @@ reader.read_exact(&mut sector)?;
 reader.seek(SeekFrom::Start(1_048_576))?;
 ```
 
-### Pass to a filesystem crate
-
-`VmdkReader<R>` implements `Read + Seek` for any `R: Read + Seek`, so it drops
-directly into any crate that accepts a reader:
+`VmdkReader<R>` is generic over any `R: Read + Seek`, so it works with `File`,
+`Cursor<Vec<u8>>`, or any custom reader:
 
 ```rust
-use vmdk::VmdkReader;
-use std::fs::File;
+// In-memory (tests, embedded use)
+use std::io::Cursor;
+let reader = VmdkReader::open(Cursor::new(bytes))?;
 
+// Pass directly to a filesystem crate
 let reader = VmdkReader::open(File::open("disk.vmdk")?)?;
-// e.g. ext4fs_forensic::Filesystem::open(reader)?;
+// e.g. ext4::Filesystem::open(reader)?;
 ```
+
+### CLI
+
+The `vmdk-cli` crate ships a `vmdk` binary:
+
+```
+$ vmdk info disk.vmdk
+File:              disk.vmdk
+Format:            VMDK v1 (monolithicSparse)
+Virtual disk size: 4,194,304 bytes (4.00 MiB)
+Sector size:       512 bytes
+```
+
+Unsupported formats (stream-optimized, flat extents) print an error to stderr and
+exit with a non-zero status.
 
 ---
 
 ## Supported formats
 
-| Format | Supported |
-|--------|:---------:|
+| Format | Status |
+|--------|:------:|
 | Monolithic sparse (`monolithicSparse`) | ✓ |
 | VMware Workstation / Fusion native | ✓ |
 | ESXi-exported sparse | ✓ |
-| Flat extent (`monolithicFlat`) | planned |
-| Stream-optimised (`streamOptimized`) | planned |
+| Flat extent (`twoGbMaxExtentFlat`, `monolithicFlat`) | — planned |
+| Stream-optimised (`streamOptimized`) | — planned |
 
-Read-only. Flat extents and stream-optimised VMDKs are not yet supported.
+Read-only. Multi-extent flat and stream-optimised VMDKs are not yet supported;
+`VmdkReader::open` returns `Err` (never panics) on unsupported inputs.
+
+---
+
+## Format overview
+
+```
+byte 0        SparseExtentHeader (512 bytes)
+sector 1–20   embedded text descriptor (createType, CID, extent map)
+sector 21–25  redundant grain directory (not used)
+sector 26     primary grain directory — one u32 per grain table
+sector 27+    grain tables — one u32 (sector offset) per grain
+sector 128+   grain data — raw 64 KiB blocks of virtual sector content
+```
+
+Virtual offset resolution is O(1): one GD lookup (in-memory) + one GT read (4 bytes)
++ one grain data seek.
 
 ---
 
