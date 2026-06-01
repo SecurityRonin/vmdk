@@ -90,29 +90,41 @@ impl<R: Read + Seek> VmdkReader<R> {
         reader.read_exact(&mut hdr_bytes)?;
         let hdr = SparseExtentHeader::parse(&hdr_bytes)?;
 
-        let grain_size_bytes = hdr.grain_size.checked_mul(SECTOR_SIZE)
+        let grain_size_bytes = hdr
+            .grain_size
+            .checked_mul(SECTOR_SIZE)
             .ok_or_else(|| VmdkError::InvalidGeometry("grain_size overflow".into()))?;
-        let virtual_disk_size = hdr.capacity.checked_mul(SECTOR_SIZE)
+        let virtual_disk_size = hdr
+            .capacity
+            .checked_mul(SECTOR_SIZE)
             .ok_or_else(|| VmdkError::InvalidGeometry("capacity overflow".into()))?;
 
         // Parse embedded descriptor for createType ("monolithicSparse", etc.).
         let disk_type = read_descriptor_create_type(&mut reader, &hdr)?;
 
         // Load grain directory (small enough to keep in memory).
-        let num_grains = hdr.capacity.checked_add(hdr.grain_size - 1)
+        let num_grains = hdr
+            .capacity
+            .checked_add(hdr.grain_size - 1)
             .ok_or_else(|| VmdkError::InvalidGeometry("capacity+grain_size overflow".into()))?
             / hdr.grain_size;
-        let num_gts = num_grains.checked_add(u64::from(hdr.num_gtes_per_gt) - 1)
+        let num_gts = num_grains
+            .checked_add(u64::from(hdr.num_gtes_per_gt) - 1)
             .ok_or_else(|| VmdkError::InvalidGeometry("num_grains overflow".into()))?
             / u64::from(hdr.num_gtes_per_gt);
-        let gd_byte_len = num_gts.checked_mul(4)
+        let gd_byte_len = num_gts
+            .checked_mul(4)
             .ok_or_else(|| VmdkError::InvalidGeometry("gd_byte_len overflow".into()))?;
 
         const MAX_GD_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB — prevents OOM on crafted images
         if gd_byte_len > MAX_GD_BYTES {
-            return Err(VmdkError::InvalidGeometry("grain directory too large".into()));
+            return Err(VmdkError::InvalidGeometry(
+                "grain directory too large".into(),
+            ));
         }
-        let gd_sector_offset = hdr.gd_offset.checked_mul(SECTOR_SIZE)
+        let gd_sector_offset = hdr
+            .gd_offset
+            .checked_mul(SECTOR_SIZE)
             .ok_or_else(|| VmdkError::InvalidGeometry("gd_offset overflow".into()))?;
         reader.seek(SeekFrom::Start(gd_sector_offset))?;
         let mut gd_bytes = vec![0u8; gd_byte_len as usize];
@@ -237,12 +249,12 @@ mod tests {
     /// Build a minimal valid VMDK header (512 bytes) with configurable geometry.
     fn vmdk_header_bytes(capacity_sectors: u64, grain_size: u64, num_gtes_per_gt: u32) -> Vec<u8> {
         let mut h = vec![0u8; 512];
-        h[0..4].copy_from_slice(&0x564D_444B_u32.to_le_bytes());         // magic
-        h[4..8].copy_from_slice(&1u32.to_le_bytes());                    // version 1
-        h[12..20].copy_from_slice(&capacity_sectors.to_le_bytes());      // capacity (sectors)
-        h[20..28].copy_from_slice(&grain_size.to_le_bytes());            // grain_size (sectors)
-        h[44..48].copy_from_slice(&num_gtes_per_gt.to_le_bytes());       // num_gtes_per_gt
-        // compress_algorithm at bytes 77..79 stays 0 (no compression)
+        h[0..4].copy_from_slice(&0x564D_444B_u32.to_le_bytes()); // magic
+        h[4..8].copy_from_slice(&1u32.to_le_bytes()); // version 1
+        h[12..20].copy_from_slice(&capacity_sectors.to_le_bytes()); // capacity (sectors)
+        h[20..28].copy_from_slice(&grain_size.to_le_bytes()); // grain_size (sectors)
+        h[44..48].copy_from_slice(&num_gtes_per_gt.to_le_bytes()); // num_gtes_per_gt
+                                                                   // compress_algorithm at bytes 77..79 stays 0 (no compression)
         h
     }
 
@@ -356,9 +368,13 @@ mod tests {
 
         let vmdk_path = tmp.path().join("test.vmdk");
         let status = std::process::Command::new(QEMU_IMG)
-            .args(["convert", "-O", "vmdk",
-                   raw_path.to_str().expect("UTF-8 path"),
-                   vmdk_path.to_str().expect("UTF-8 path")])
+            .args([
+                "convert",
+                "-O",
+                "vmdk",
+                raw_path.to_str().expect("UTF-8 path"),
+                vmdk_path.to_str().expect("UTF-8 path"),
+            ])
             .status()
             .expect("spawn qemu-img");
         assert!(status.success(), "qemu-img convert failed");
@@ -391,25 +407,34 @@ mod tests {
         if !std::path::Path::new(QEMU_IMG).exists() {
             return;
         }
-        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/data/dfvfs_ext2.vmdk");
+        let corpus =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/dfvfs_ext2.vmdk");
         if !corpus.exists() {
             return;
         }
         let tmp = tempfile::tempdir().expect("tempdir");
         let raw_path = tmp.path().join("ext2.raw");
         let ok = std::process::Command::new(QEMU_IMG)
-            .args(["convert", "-O", "raw",
-                   corpus.to_str().expect("UTF-8 path"),
-                   raw_path.to_str().expect("UTF-8 path")])
-            .status().expect("spawn qemu-img").success();
+            .args([
+                "convert",
+                "-O",
+                "raw",
+                corpus.to_str().expect("UTF-8 path"),
+                raw_path.to_str().expect("UTF-8 path"),
+            ])
+            .status()
+            .expect("spawn qemu-img")
+            .success();
         assert!(ok, "qemu-img convert failed for dfvfs_ext2.vmdk");
         let ref_data = std::fs::read(&raw_path).expect("read reference raw");
 
         let file = File::open(&corpus).expect("open dfvfs_ext2.vmdk");
         let mut reader = VmdkReader::open(file).expect("open");
-        assert_eq!(reader.virtual_disk_size(), ref_data.len() as u64,
-            "virtual_disk_size must match qemu-img raw for dfvfs_ext2.vmdk");
+        assert_eq!(
+            reader.virtual_disk_size(),
+            ref_data.len() as u64,
+            "virtual_disk_size must match qemu-img raw for dfvfs_ext2.vmdk"
+        );
 
         let vsize = ref_data.len();
         let step = 4096usize;
@@ -420,7 +445,8 @@ mod tests {
             reader.seek(SeekFrom::Start(offset as u64)).expect("seek");
             reader.read_exact(&mut buf).expect("read");
             assert_eq!(
-                buf, ref_data[offset..offset + len],
+                buf,
+                ref_data[offset..offset + len],
                 "byte mismatch at offset {offset:#x} in dfvfs_ext2.vmdk",
             );
             offset += step;
@@ -436,25 +462,34 @@ mod tests {
         if !std::path::Path::new(QEMU_IMG).exists() {
             return;
         }
-        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/data/minimal.vmdk");
+        let corpus =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/minimal.vmdk");
         if !corpus.exists() {
             return;
         }
         let tmp = tempfile::tempdir().expect("tempdir");
         let raw_path = tmp.path().join("minimal.raw");
         let ok = std::process::Command::new(QEMU_IMG)
-            .args(["convert", "-O", "raw",
-                   corpus.to_str().expect("UTF-8 path"),
-                   raw_path.to_str().expect("UTF-8 path")])
-            .status().expect("spawn qemu-img").success();
+            .args([
+                "convert",
+                "-O",
+                "raw",
+                corpus.to_str().expect("UTF-8 path"),
+                raw_path.to_str().expect("UTF-8 path"),
+            ])
+            .status()
+            .expect("spawn qemu-img")
+            .success();
         assert!(ok, "qemu-img convert failed");
         let ref_data = std::fs::read(&raw_path).expect("read raw");
 
         let file = File::open(&corpus).expect("open corpus vmdk");
         let mut reader = VmdkReader::open(file).expect("open");
-        assert_eq!(reader.virtual_disk_size(), ref_data.len() as u64,
-            "virtual_disk_size must match reference raw length");
+        assert_eq!(
+            reader.virtual_disk_size(),
+            ref_data.len() as u64,
+            "virtual_disk_size must match reference raw length"
+        );
 
         let vsize = ref_data.len();
         let grain = 65536usize;
@@ -465,7 +500,8 @@ mod tests {
             reader.seek(SeekFrom::Start(offset as u64)).expect("seek");
             reader.read_exact(&mut buf).expect("read");
             assert_eq!(
-                buf, ref_data[offset..offset + len],
+                buf,
+                ref_data[offset..offset + len],
                 "byte mismatch at offset {offset:#x}",
             );
         }

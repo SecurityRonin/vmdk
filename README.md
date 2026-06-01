@@ -21,11 +21,14 @@ vmdk = "0.1"
 
 ```rust
 use vmdk::VmdkReader;
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
-let mut reader = VmdkReader::open("disk.vmdk")?;
+let file = File::open("disk.vmdk")?;
+let mut reader = VmdkReader::open(file)?;
 
 println!("Virtual disk size: {} bytes", reader.virtual_disk_size());
+println!("Disk type: {}", reader.disk_type()); // e.g. "monolithicSparse"
 
 // Read the first sector
 let mut sector = [0u8; 512];
@@ -37,12 +40,14 @@ reader.seek(SeekFrom::Start(1_048_576))?;
 
 ### Pass to a filesystem crate
 
-`VmdkReader` implements `Read + Seek`, so it drops directly into any crate that accepts a reader:
+`VmdkReader<R>` implements `Read + Seek` for any `R: Read + Seek`, so it drops
+directly into any crate that accepts a reader:
 
 ```rust
 use vmdk::VmdkReader;
+use std::fs::File;
 
-let reader = VmdkReader::open("disk.vmdk")?;
+let reader = VmdkReader::open(File::open("disk.vmdk")?)?;
 // e.g. ext4fs_forensic::Filesystem::open(reader)?;
 ```
 

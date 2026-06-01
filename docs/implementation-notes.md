@@ -129,6 +129,48 @@ if num_gtes_per_gt == 0 {
 
 ---
 
+## 8. Embedded text descriptor — `createType` parsing
+
+Every monolithic sparse VMDK embeds a NUL-terminated text descriptor inside the file,
+starting at `descriptor_offset × 512` bytes and spanning `descriptor_size × 512` bytes.
+The descriptor contains key=value pairs (including comment lines beginning with `#`).
+
+```
+# Disk DescriptorFile
+version=1
+CID=5e81b00f
+parentCID=ffffffff
+createType="monolithicSparse"
+
+# Extent description
+RW 2048 SPARSE "disk.vmdk"
+...
+```
+
+**`createType` field** governs the VMDK subformat:
+
+| Value | Meaning |
+|-------|---------|
+| `monolithicSparse` | Single-file sparse (supported) |
+| `twoGbMaxExtentFlat` | Multi-extent flat (not supported) |
+| `streamOptimized` | DEFLATE-compressed (not supported — version 3, rejected at header parse) |
+
+**Parsing notes:**
+- `descriptor_offset == 0` or `descriptor_size == 0` → no embedded descriptor; `disk_type()` returns `""`
+- The text area is zero-padded after the descriptor text; scanning stops at the first `\0` byte
+- `descriptor_size` is capped at 64 KiB for the read to guard against crafted images with enormous field values
+- Line endings may be `\n` or `\r\n`; `str::lines()` handles both
+- `createType` value is always ASCII and always double-quoted: `createType="monolithicSparse"`
+
+**Empirically verified** against both corpus files:
+
+| File | `descriptor_offset` | `descriptor_size` | `createType` |
+|------|---------------------|-------------------|--------------|
+| `minimal.vmdk` (QEMU 11.0.0) | 1 | 20 | `monolithicSparse` |
+| `dfvfs_ext2.vmdk` (VMware4) | 1 | 20 | `monolithicSparse` |
+
+---
+
 ## Upstream PR candidates
 
 | Project | File | Suggested change |

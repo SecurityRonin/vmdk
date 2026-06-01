@@ -22,10 +22,10 @@ const NUM_GTES_PER_GT: u32 = 512;
 const DESCRIPTOR_OFFSET: u64 = 1;
 const DESCRIPTOR_SECTORS: u64 = 20;
 const GD_SECTOR: u64 = DESCRIPTOR_OFFSET + DESCRIPTOR_SECTORS; // 21
-const RGD_SECTOR: u64 = GD_SECTOR + 1;                          // 22
-const GT_SECTOR: u64 = RGD_SECTOR + 1;                          // 23
+const RGD_SECTOR: u64 = GD_SECTOR + 1; // 22
+const GT_SECTOR: u64 = RGD_SECTOR + 1; // 23
 const GT_SECTORS: u64 = 4;
-const GRAIN_SECTOR: u64 = GT_SECTOR + GT_SECTORS;               // 27
+const GRAIN_SECTOR: u64 = GT_SECTOR + GT_SECTORS; // 27
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
@@ -45,7 +45,7 @@ fn minimal_vmdk(sector_data: &[u8]) -> Vec<u8> {
     hdr[36..44].copy_from_slice(&DESCRIPTOR_SECTORS.to_le_bytes());
     hdr[44..48].copy_from_slice(&NUM_GTES_PER_GT.to_le_bytes());
     hdr[48..56].copy_from_slice(&RGD_SECTOR.to_le_bytes()); // rgdOffset
-    hdr[56..64].copy_from_slice(&GD_SECTOR.to_le_bytes());  // gdOffset
+    hdr[56..64].copy_from_slice(&GD_SECTOR.to_le_bytes()); // gdOffset
     hdr[64..72].copy_from_slice(&GRAIN_SECTOR.to_le_bytes()); // overHead
     hdr[72] = 0; // uncleanShutdown
     hdr[73] = b'\n';

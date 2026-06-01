@@ -8,12 +8,12 @@ pub const SECTOR_SIZE: u64 = 512;
 
 /// Parsed fields from the 512-byte SparseExtentHeader.
 pub struct SparseExtentHeader {
-    pub capacity: u64,            // virtual disk size in sectors
-    pub grain_size: u64,          // grain size in sectors
-    pub descriptor_offset: u64,   // in sectors
-    pub descriptor_size: u64,     // in sectors
+    pub capacity: u64,          // virtual disk size in sectors
+    pub grain_size: u64,        // grain size in sectors
+    pub descriptor_offset: u64, // in sectors
+    pub descriptor_size: u64,   // in sectors
     pub num_gtes_per_gt: u32,
-    pub gd_offset: u64,           // grain directory offset in sectors
+    pub gd_offset: u64, // grain directory offset in sectors
 }
 
 impl SparseExtentHeader {
@@ -49,7 +49,9 @@ impl SparseExtentHeader {
             return Err(VmdkError::InvalidGeometry("grain_size must be > 0".into()));
         }
         if num_gtes_per_gt == 0 {
-            return Err(VmdkError::InvalidGeometry("num_gtes_per_gt must be > 0".into()));
+            return Err(VmdkError::InvalidGeometry(
+                "num_gtes_per_gt must be > 0".into(),
+            ));
         }
 
         Ok(SparseExtentHeader {
