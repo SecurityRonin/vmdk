@@ -1,4 +1,4 @@
-//! Sparse extent header (VMware Virtual Disk Format 1.1, §4.1).
+//! Sparse extent header (Virtual Disk Format 1.1, §4.1).
 
 use crate::error::{Result, VmdkError};
 
@@ -6,7 +6,7 @@ pub const MAGIC: u32 = 0x564D_444B;
 pub const VERSION: u32 = 1;
 pub const SECTOR_SIZE: u64 = 512;
 
-/// Parsed fields from the 512-byte SparseExtentHeader.
+/// Parsed fields from the 512-byte `SparseExtentHeader`.
 pub struct SparseExtentHeader {
     pub capacity: u64,          // virtual disk size in sectors
     pub grain_size: u64,        // grain size in sectors
@@ -14,6 +14,8 @@ pub struct SparseExtentHeader {
     pub descriptor_size: u64,   // in sectors
     pub num_gtes_per_gt: u32,
     pub gd_offset: u64, // grain directory offset in sectors
+    /// `true` when `compress_algorithm == 1` (stream-optimised / DEFLATE).
+    pub compressed: bool,
 }
 
 impl SparseExtentHeader {
@@ -61,6 +63,7 @@ impl SparseExtentHeader {
             descriptor_size,
             num_gtes_per_gt,
             gd_offset,
+            compressed: compress_algorithm != 0,
         })
     }
 }

@@ -1,4 +1,4 @@
-//! Cursor-based synthetic tests for VmdkReader — no disk I/O.
+//! Cursor-based synthetic tests for `VmdkReader` — no disk I/O.
 //!
 //! All tests drive `VmdkReader::open(Cursor::new(img))`.  Because the public
 //! API is generic (`VmdkReader<R: Read + Seek>`), no files are touched; a

@@ -96,18 +96,6 @@ fn info_errors_on_stream_optimized() {
 }
 
 #[test]
-fn info_errors_on_flat_descriptor() {
-    let out = vmdk_bin()
-        .args(["info", &data_path("flat.vmdk")])
-        .output()
-        .expect("vmdk binary must run");
-    assert!(
-        !out.status.success(),
-        "flat VMDK descriptor should exit non-zero (unsupported format)"
-    );
-}
-
-#[test]
 fn info_shows_flat_vmdk_disk_type() {
     let out = vmdk_bin()
         .args(["info", &data_path("flat.vmdk")])

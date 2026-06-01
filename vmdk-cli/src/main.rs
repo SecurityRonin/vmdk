@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::path::PathBuf;
 use std::process;
 
@@ -34,14 +33,7 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::Info { path } => {
-            let file = match File::open(&path) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            };
-            let reader = match VmdkReader::open(file) {
+            let reader = match VmdkReader::open_path(&path) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("error: {e}");

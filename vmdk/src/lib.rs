@@ -1,16 +1,55 @@
-//! Pure-Rust read-only VMware VMDK sparse disk image reader.
+//! Pure-Rust read-only VMDK disk image reader.
 //!
-//! Supports monolithic sparse VMDKs (VMware Workstation/Fusion format).
-//! Flat extents and compressed (stream-optimized) VMDKs are not supported.
+//! Supports monolithic sparse (`monolithicSparse`), stream-optimised
+//! (`streamOptimized`, sparse-grain read), and flat-extent VMDKs
+//! (`twoGbMaxExtentFlat`, `monolithicFlat`).
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
 
-mod error;
+mod descriptor;
+pub(crate) mod error;
+mod flat;
 mod header;
 
 pub use error::VmdkError;
 
+use descriptor::parse_text_descriptor;
+use flat::MultiExtentReader;
 use header::{SparseExtentHeader, SECTOR_SIZE};
+
+// ── Public API types ──────────────────────────────────────────────────────────
+
+/// Object-safe combination of [`Read`] and [`Seek`].
+///
+/// Automatically implemented for all `T: Read + Seek`.  Used as the inner
+/// reader type for [`VmdkFileReader`].
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+/// A VMDK reader opened from a file-system path, with an erased inner type.
+///
+/// Returned by [`VmdkReader::open_path`]; supports all formats including
+/// multi-file flat extents that cannot be opened from a single stream.
+pub type VmdkFileReader = VmdkReader<Box<dyn ReadSeek + Send>>;
+
+// ── Internal format dispatch ──────────────────────────────────────────────────
+
+enum FormatState {
+    Sparse {
+        grain_dir: Vec<u32>,
+        grain_size_bytes: u64,
+        num_gtes_per_gt: u64,
+        /// `true` for stream-optimised (v3) VMDKs; allocated grains would be
+        /// DEFLATE-compressed and are not yet supported for reading.
+        compressed: bool,
+    },
+    /// Raw flat extents — reads pass through directly to the inner reader.
+    Flat,
+}
+
+// ── VmdkReader ────────────────────────────────────────────────────────────────
 
 /// Read-only VMDK container reader, generic over any `Read + Seek` source.
 ///
@@ -28,22 +67,15 @@ use header::{SparseExtentHeader, SECTOR_SIZE};
 /// ```
 pub struct VmdkReader<R: Read + Seek> {
     inner: R,
+    fmt: FormatState,
     virtual_disk_size: u64,
-    grain_size_bytes: u64,
-    grain_dir: Vec<u32>,
-    num_gtes_per_gt: u64,
-    pos: u64,
     disk_type: Box<str>,
+    pos: u64,
 }
 
-/// Maximum bytes we'll read from the embedded descriptor (64 KiB is far more than any
-/// real descriptor; guards against crafted images with huge `descriptor_size` values).
+/// Maximum bytes read from an embedded descriptor (guards against crafted images).
 const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 
-/// Read the embedded text descriptor and extract the `createType` field value.
-///
-/// Returns an empty `Box<str>` when there is no embedded descriptor
-/// (`descriptor_offset == 0` or `descriptor_size == 0`).
 fn read_descriptor_create_type<R: Read + Seek>(
     reader: &mut R,
     hdr: &SparseExtentHeader,
@@ -66,9 +98,6 @@ fn read_descriptor_create_type<R: Read + Seek>(
     Ok(Box::from(parse_create_type(&buf)))
 }
 
-/// Scan a raw descriptor buffer for `createType="<value>"` and return the value.
-///
-/// Stops at the first NUL byte so trailing padding does not affect parsing.
 fn parse_create_type(buf: &[u8]) -> &str {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     let text = match std::str::from_utf8(&buf[..end]) {
@@ -84,7 +113,11 @@ fn parse_create_type(buf: &[u8]) -> &str {
 }
 
 impl<R: Read + Seek> VmdkReader<R> {
-    /// Open a monolithic sparse VMDK from any `Read + Seek` source.
+    /// Open a binary VMDK (monolithic sparse or stream-optimised) from any
+    /// `Read + Seek` source.
+    ///
+    /// For multi-file flat VMDKs (text descriptor + extent files) use
+    /// [`VmdkReader::open_path`] instead.
     pub fn open(mut reader: R) -> Result<Self, VmdkError> {
         let mut hdr_bytes = [0u8; 512];
         reader.read_exact(&mut hdr_bytes)?;
@@ -99,10 +132,8 @@ impl<R: Read + Seek> VmdkReader<R> {
             .checked_mul(SECTOR_SIZE)
             .ok_or_else(|| VmdkError::InvalidGeometry("capacity overflow".into()))?;
 
-        // Parse embedded descriptor for createType ("monolithicSparse", etc.).
         let disk_type = read_descriptor_create_type(&mut reader, &hdr)?;
 
-        // Load grain directory (small enough to keep in memory).
         let num_grains = hdr
             .capacity
             .checked_add(hdr.grain_size - 1)
@@ -116,7 +147,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             .checked_mul(4)
             .ok_or_else(|| VmdkError::InvalidGeometry("gd_byte_len overflow".into()))?;
 
-        const MAX_GD_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB — prevents OOM on crafted images
+        const MAX_GD_BYTES: u64 = 16 * 1024 * 1024;
         if gd_byte_len > MAX_GD_BYTES {
             return Err(VmdkError::InvalidGeometry(
                 "grain directory too large".into(),
@@ -137,71 +168,158 @@ impl<R: Read + Seek> VmdkReader<R> {
 
         Ok(VmdkReader {
             inner: reader,
+            fmt: FormatState::Sparse {
+                grain_dir,
+                grain_size_bytes,
+                num_gtes_per_gt: u64::from(hdr.num_gtes_per_gt),
+                compressed: hdr.compressed,
+            },
             virtual_disk_size,
-            grain_size_bytes,
-            grain_dir,
-            num_gtes_per_gt: u64::from(hdr.num_gtes_per_gt),
-            pos: 0,
             disk_type,
+            pos: 0,
         })
     }
 
-    /// Virtual disk size in bytes as recorded in the VMDK header.
+    /// Virtual disk size in bytes.
     pub fn virtual_disk_size(&self) -> u64 {
         self.virtual_disk_size
     }
 
-    /// `createType` field from the embedded text descriptor (e.g. `"monolithicSparse"`).
+    /// `createType` from the embedded text descriptor (e.g. `"monolithicSparse"`).
     ///
-    /// Returns an empty string if the VMDK has no embedded descriptor.
+    /// Returns an empty string when no embedded descriptor is present.
     pub fn disk_type(&self) -> &str {
         &self.disk_type
     }
 
-    /// Resolve `virtual_offset` → file offset, or `None` for a sparse grain.
+    /// Resolve `virtual_offset` to a file byte offset, or `None` for a sparse grain.
+    ///
+    /// Returns `Err` if the grain is allocated but compressed (stream-optimised
+    /// VMDKs with actual grain data are not yet supported).
     fn file_offset_for(&mut self, virtual_offset: u64) -> io::Result<Option<u64>> {
-        let grain_idx = virtual_offset / self.grain_size_bytes;
-        let offset_in_grain = virtual_offset % self.grain_size_bytes;
-
-        let gd_idx = grain_idx / self.num_gtes_per_gt;
-        let gte_idx = grain_idx % self.num_gtes_per_gt;
-
-        let gt_sector = self.grain_dir.get(gd_idx as usize).copied().unwrap_or(0);
+        let (gt_sector, gte_idx, offset_in_grain, compressed) = {
+            let FormatState::Sparse {
+                grain_dir,
+                grain_size_bytes,
+                num_gtes_per_gt,
+                compressed,
+            } = &self.fmt
+            else {
+                return Ok(None); // Flat — no GTE lookup
+            };
+            let grain_idx = virtual_offset / grain_size_bytes;
+            let offset_in_grain = virtual_offset % grain_size_bytes;
+            let gd_idx = (grain_idx / num_gtes_per_gt) as usize;
+            let gte_idx = grain_idx % num_gtes_per_gt;
+            let gt_sector = grain_dir.get(gd_idx).copied().unwrap_or(0);
+            (gt_sector, gte_idx, offset_in_grain, *compressed)
+        };
         if gt_sector == 0 {
             return Ok(None);
         }
-
         let gte_file_pos = u64::from(gt_sector) * SECTOR_SIZE + gte_idx * 4;
         self.inner.seek(SeekFrom::Start(gte_file_pos))?;
         let mut gte_bytes = [0u8; 4];
         self.inner.read_exact(&mut gte_bytes)?;
         let gte = u32::from_le_bytes(gte_bytes);
-
         if gte <= 1 {
-            return Ok(None); // sparse or zeroed
+            return Ok(None); // sparse or explicitly-zeroed grain
         }
-
+        if compressed {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "allocated compressed grains (streamOptimized) are not yet supported",
+            ));
+        }
         Ok(Some(u64::from(gte) * SECTOR_SIZE + offset_in_grain))
     }
 }
+
+// ── open_path (path-aware, all formats) ──────────────────────────────────────
+
+impl VmdkFileReader {
+    /// Open any VMDK format from a file-system path.
+    ///
+    /// Unlike [`VmdkReader::open`], this constructor handles text-descriptor
+    /// VMDKs (`twoGbMaxExtentFlat`) that reference external extent files, as
+    /// well as binary VMDKs that can be opened from a single stream.
+    pub fn open_path(path: &Path) -> Result<Self, VmdkError> {
+        // Peek at the first byte to distinguish text descriptors from binary VMDKs.
+        let first_byte = {
+            let mut buf = [0u8; 1];
+            File::open(path)?.read_exact(&mut buf)?;
+            buf[0]
+        };
+
+        if first_byte == b'#' {
+            // Text descriptor: parse extents and build a multi-file reader.
+            let text = std::fs::read_to_string(path)?;
+            let desc = parse_text_descriptor(&text)?;
+            let dir = path.parent().unwrap_or(Path::new("."));
+            let multi = MultiExtentReader::open(dir, &desc.extents)?;
+            let virtual_disk_size = desc
+                .capacity_sectors
+                .checked_mul(SECTOR_SIZE)
+                .ok_or_else(|| VmdkError::InvalidGeometry("capacity overflow".into()))?;
+            Ok(VmdkReader {
+                inner: Box::new(multi) as Box<dyn ReadSeek + Send>,
+                fmt: FormatState::Flat,
+                virtual_disk_size,
+                disk_type: desc.create_type,
+                pos: 0,
+            })
+        } else {
+            // Binary VMDK — parse normally then erase the reader type.
+            let file = BufReader::new(File::open(path)?);
+            Ok(VmdkReader::open(file)?.into_file_reader())
+        }
+    }
+}
+
+impl<R: Read + Seek + Send + 'static> VmdkReader<R> {
+    fn into_file_reader(self) -> VmdkFileReader {
+        VmdkFileReader {
+            inner: Box::new(self.inner),
+            fmt: self.fmt,
+            virtual_disk_size: self.virtual_disk_size,
+            disk_type: self.disk_type,
+            pos: self.pos,
+        }
+    }
+}
+
+// ── Read + Seek impls ─────────────────────────────────────────────────────────
 
 impl<R: Read + Seek> Read for VmdkReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.pos >= self.virtual_disk_size || buf.is_empty() {
             return Ok(0);
         }
-
         let remaining_virtual = (self.virtual_disk_size - self.pos) as usize;
-        // Don't cross a grain boundary in a single read.
-        let remaining_in_grain =
-            (self.grain_size_bytes - (self.pos % self.grain_size_bytes)) as usize;
+
+        // Flat: direct pass-through to the inner reader at the current position.
+        if matches!(self.fmt, FormatState::Flat) {
+            let to_read = buf.len().min(remaining_virtual);
+            self.inner.seek(SeekFrom::Start(self.pos))?;
+            let n = self.inner.read(&mut buf[..to_read])?;
+            self.pos += n as u64;
+            return Ok(n);
+        }
+
+        // Sparse / StreamOptimized: clamp at grain boundary then do GTE lookup.
+        let grain_size_bytes = match &self.fmt {
+            FormatState::Sparse {
+                grain_size_bytes, ..
+            } => *grain_size_bytes,
+            FormatState::Flat => unreachable!(),
+        };
+        let remaining_in_grain = (grain_size_bytes - (self.pos % grain_size_bytes)) as usize;
         let to_read = buf.len().min(remaining_virtual).min(remaining_in_grain);
 
         let n = if let Some(file_off) = self.file_offset_for(self.pos)? {
             self.inner.seek(SeekFrom::Start(file_off))?;
             self.inner.read(&mut buf[..to_read])?
         } else {
-            // Sparse grain — return zeros.
             buf[..to_read].fill(0);
             to_read
         };
@@ -244,37 +362,27 @@ mod tests {
     use std::io::Cursor;
     use testutil::{test_sparse_vmdk, GRAIN_SIZE_BYTES};
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    /// Build a minimal valid VMDK header (512 bytes) with configurable geometry.
     fn vmdk_header_bytes(capacity_sectors: u64, grain_size: u64, num_gtes_per_gt: u32) -> Vec<u8> {
         let mut h = vec![0u8; 512];
-        h[0..4].copy_from_slice(&0x564D_444B_u32.to_le_bytes()); // magic
-        h[4..8].copy_from_slice(&1u32.to_le_bytes()); // version 1
-        h[12..20].copy_from_slice(&capacity_sectors.to_le_bytes()); // capacity (sectors)
-        h[20..28].copy_from_slice(&grain_size.to_le_bytes()); // grain_size (sectors)
-        h[44..48].copy_from_slice(&num_gtes_per_gt.to_le_bytes()); // num_gtes_per_gt
-                                                                   // compress_algorithm at bytes 77..79 stays 0 (no compression)
+        h[0..4].copy_from_slice(&0x564D_444B_u32.to_le_bytes());
+        h[4..8].copy_from_slice(&1u32.to_le_bytes());
+        h[12..20].copy_from_slice(&capacity_sectors.to_le_bytes());
+        h[20..28].copy_from_slice(&grain_size.to_le_bytes());
+        h[44..48].copy_from_slice(&num_gtes_per_gt.to_le_bytes());
         h
     }
 
-    // ── Panic regression tests (RED until header.rs validates grain geometry) ─
-
     #[test]
     fn grain_size_zero_rejected() {
-        // grain_size=0 triggers div-by-zero on `(capacity + grain_size - 1) / grain_size`
         let img = vmdk_header_bytes(8, 0, 512);
         assert!(VmdkReader::open(Cursor::new(img)).is_err());
     }
 
     #[test]
     fn num_gtes_per_gt_zero_rejected() {
-        // num_gtes_per_gt=0 triggers div-by-zero on `(num_grains + 0 - 1) / 0`
         let img = vmdk_header_bytes(8, 8, 0);
         assert!(VmdkReader::open(Cursor::new(img)).is_err());
     }
-
-    // ── Existing tests ────────────────────────────────────────────────────────
 
     #[test]
     fn open_empty_file_returns_err() {
@@ -325,8 +433,6 @@ mod tests {
         assert_send::<VmdkReader<Cursor<Vec<u8>>>>();
     }
 
-    // ── Property tests: open() never panics on arbitrary input ────────────────
-
     proptest::proptest! {
         #[test]
         fn open_never_panics_on_arbitrary_bytes(
@@ -339,7 +445,6 @@ mod tests {
         fn open_never_panics_on_valid_magic_plus_garbage(
             suffix in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..8192)
         ) {
-            // Correct magic + version 1 prefix — exercises field parsing with random data.
             let mut bytes = vec![0u8; 8];
             bytes[0..4].copy_from_slice(&0x564D_444B_u32.to_le_bytes());
             bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
@@ -347,8 +452,6 @@ mod tests {
             let _ = VmdkReader::open(Cursor::new(bytes));
         }
     }
-
-    // ── Differential test: bytes must match qemu-img convert -O raw output ────
 
     #[test]
     fn reads_match_qemu_raw_convert() {
@@ -358,14 +461,10 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().expect("tempdir");
-
-        // 1 MiB source with a deterministic non-trivial pattern covering
-        // sector and grain boundaries (default grain = 128 sectors = 65536 B).
         let size: usize = 1 << 20;
         let raw_data: Vec<u8> = (0..size).map(|i| (i ^ (i >> 8)) as u8).collect();
         let raw_path = tmp.path().join("source.raw");
         std::fs::write(&raw_path, &raw_data).expect("write raw");
-
         let vmdk_path = tmp.path().join("test.vmdk");
         let status = std::process::Command::new(QEMU_IMG)
             .args([
@@ -378,13 +477,10 @@ mod tests {
             .status()
             .expect("spawn qemu-img");
         assert!(status.success(), "qemu-img convert failed");
-
         let file = File::open(&vmdk_path).expect("open vmdk file");
         let mut reader = VmdkReader::open(file).expect("open");
         assert_eq!(reader.virtual_disk_size(), size as u64);
-
-        // Sample: start, mid-sector, grain boundary, grain+sector, near-end.
-        let grain = 512 * 128; // 65536 B — qemu default VMDK grain size
+        let grain = 512 * 128;
         for &offset in &[0usize, 511, grain, grain + 512, size - 512] {
             let len = 512.min(size - offset);
             let mut buf = vec![0u8; len];
@@ -393,12 +489,10 @@ mod tests {
             assert_eq!(
                 buf,
                 raw_data[offset..offset + len],
-                "byte mismatch at offset {offset:#x}",
+                "byte mismatch at {offset:#x}"
             );
         }
     }
-
-    // ── Corpus differential test: dfvfs VMware4 ext2.vmdk (independent origin) ─
 
     #[test]
     fn corpus_dfvfs_ext2_vmdk_reads_match_qemu_raw_convert() {
@@ -427,7 +521,6 @@ mod tests {
             .success();
         assert!(ok, "qemu-img convert failed for dfvfs_ext2.vmdk");
         let ref_data = std::fs::read(&raw_path).expect("read reference raw");
-
         let file = File::open(&corpus).expect("open dfvfs_ext2.vmdk");
         let mut reader = VmdkReader::open(file).expect("open");
         assert_eq!(
@@ -435,7 +528,6 @@ mod tests {
             ref_data.len() as u64,
             "virtual_disk_size must match qemu-img raw for dfvfs_ext2.vmdk"
         );
-
         let vsize = ref_data.len();
         let step = 4096usize;
         let mut offset = 0usize;
@@ -447,13 +539,11 @@ mod tests {
             assert_eq!(
                 buf,
                 ref_data[offset..offset + len],
-                "byte mismatch at offset {offset:#x} in dfvfs_ext2.vmdk",
+                "byte mismatch at {offset:#x} in dfvfs_ext2.vmdk"
             );
             offset += step;
         }
     }
-
-    // ── Corpus differential test: qemu-img generated minimal.vmdk ────────────
 
     #[test]
     fn corpus_minimal_vmdk_reads_match_qemu_raw_convert() {
@@ -482,19 +572,12 @@ mod tests {
             .success();
         assert!(ok, "qemu-img convert failed");
         let ref_data = std::fs::read(&raw_path).expect("read raw");
-
         let file = File::open(&corpus).expect("open corpus vmdk");
         let mut reader = VmdkReader::open(file).expect("open");
-        assert_eq!(
-            reader.virtual_disk_size(),
-            ref_data.len() as u64,
-            "virtual_disk_size must match reference raw length"
-        );
-
+        assert_eq!(reader.virtual_disk_size(), ref_data.len() as u64);
         let vsize = ref_data.len();
         let grain = 65536usize;
-        let samples = [0usize, 511, grain, grain + 512, vsize - 512];
-        for &offset in &samples {
+        for &offset in &[0usize, 511, grain, grain + 512, vsize - 512] {
             let len = 512.min(vsize - offset);
             let mut buf = vec![0u8; len];
             reader.seek(SeekFrom::Start(offset as u64)).expect("seek");
@@ -502,7 +585,7 @@ mod tests {
             assert_eq!(
                 buf,
                 ref_data[offset..offset + len],
-                "byte mismatch at offset {offset:#x}",
+                "byte mismatch at {offset:#x}"
             );
         }
     }
