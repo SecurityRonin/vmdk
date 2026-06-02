@@ -16,6 +16,7 @@ mod descriptor;
 pub(crate) mod error;
 mod flat;
 mod header;
+mod sesparse;
 mod sparse_multi;
 
 pub use chain::VmdkChainReader;
@@ -105,6 +106,12 @@ enum FormatState {
         num_gtes_per_gt: u64,
         /// `true` for stream-optimised VMDKs: allocated grains carry a zlib-wrapped payload.
         compressed: bool,
+    },
+    /// seSparse (vSphere 6.5+, VMFS6): 8-byte GD entries and 8-byte GTEs.
+    SeSparse {
+        grain_dir: Vec<u64>,
+        grain_size_bytes: u64,
+        gt_offset_sectors: u64,
     },
     /// Raw flat extents — reads pass through directly to the inner reader.
     Flat,
@@ -209,6 +216,13 @@ impl<R: Read + Seek> VmdkReader<R> {
         let magic_be = u32::from_be_bytes(hdr_bytes[0..4].try_into().expect("4 bytes"));
         if magic_be == cowd::COWD_MAGIC {
             return Self::open_cowd(reader, &hdr_bytes);
+        }
+        // Detect seSparse magic (0x0000_0000_CAFE_BABE, u64 little-endian at offset 0).
+        if hdr_bytes.len() >= 8 {
+            let se_magic = u64::from_le_bytes(hdr_bytes[0..8].try_into().expect("8 bytes"));
+            if se_magic == sesparse::SE_CONST_MAGIC {
+                return Self::open_sesparse(reader, &hdr_bytes);
+            }
         }
 
         let hdr = SparseExtentHeader::parse(&hdr_bytes)?;
@@ -320,11 +334,12 @@ impl<R: Read + Seek> VmdkReader<R> {
     /// Structured snapshot of all metadata for this image.
     pub fn info(&self) -> VmdkInfo {
         let (grain_size_sectors, grain_size_bytes, compressed) = match &self.fmt {
-            FormatState::Sparse {
-                grain_size_bytes,
-                compressed,
-                ..
-            } => (*grain_size_bytes / SECTOR_SIZE, *grain_size_bytes, *compressed),
+            FormatState::Sparse { grain_size_bytes, compressed, .. } => {
+                (*grain_size_bytes / SECTOR_SIZE, *grain_size_bytes, *compressed)
+            }
+            FormatState::SeSparse { grain_size_bytes, .. } => {
+                (*grain_size_bytes / SECTOR_SIZE, *grain_size_bytes, false)
+            }
             FormatState::Flat => (0, 0, false),
         };
         VmdkInfo {
@@ -339,6 +354,37 @@ impl<R: Read + Seek> VmdkReader<R> {
             compressed,
             descriptor_text: self.descriptor_text.to_string(),
         }
+    }
+
+    /// Open a seSparse extent file (vSphere 6.5+ VMFS6 snapshots).
+    ///
+    /// Called from `open()` when seSparse constant-header magic is detected.
+    fn open_sesparse(mut reader: R, hdr_bytes: &[u8]) -> Result<Self, VmdkError> {
+        use sesparse::open_sesparse;
+        reader.seek(SeekFrom::Start(0))?;
+        let (grain_dir, grain_size_bytes, _gtes) = open_sesparse(&mut reader)?;
+
+        let se_hdr = sesparse::SeConstHeader::parse(hdr_bytes)?;
+        let virtual_disk_size = se_hdr.capacity
+            .checked_mul(SECTOR_SIZE)
+            .ok_or_else(|| VmdkError::InvalidGeometry("seSparse capacity overflow".into()))?;
+
+        Ok(VmdkReader {
+            inner: reader,
+            fmt: FormatState::SeSparse {
+                grain_dir,
+                grain_size_bytes,
+                gt_offset_sectors: se_hdr.gt_offset,
+            },
+            virtual_disk_size,
+            disk_type: Box::from("seSparse"),
+            pos: 0,
+            version: 0,
+            cid: 0xffff_ffff,
+            parent_cid: 0xffff_ffff,
+            descriptor_text: Box::from(""),
+            gt_cache: HashMap::new(),
+        })
     }
 
     /// Open a COWD extent file (vmfsSparse / vmfsThin).
@@ -388,25 +434,38 @@ impl<R: Read + Seek> VmdkReader<R> {
         }
         // Extract all values from self.fmt before any mutable borrow of self.inner.
         let virtual_offset = lba * SECTOR_SIZE;
-        let gt_sector_and_gte = match &self.fmt {
+        match &self.fmt {
             FormatState::Flat => return Ok(true),
             FormatState::Sparse { grain_dir, grain_size_bytes, num_gtes_per_gt, .. } => {
                 let grain_idx = virtual_offset / grain_size_bytes;
                 let gd_idx = (grain_idx / num_gtes_per_gt) as usize;
                 let gte_idx = grain_idx % num_gtes_per_gt;
                 let gt_sector = grain_dir.get(gd_idx).copied().unwrap_or(0);
-                (gt_sector, gte_idx)
+                let _ = ();
+                if gt_sector == 0 { return Ok(false); }
+                let gte_pos = u64::from(gt_sector) * SECTOR_SIZE + gte_idx * 4;
+                self.inner.seek(SeekFrom::Start(gte_pos))?;
+                let mut b = [0u8; 4];
+                self.inner.read_exact(&mut b)?;
+                return Ok(u32::from_le_bytes(b) > 1);
             }
-        };
-        let (gt_sector, gte_idx) = gt_sector_and_gte;
-        if gt_sector == 0 {
-            return Ok(false);
+            FormatState::SeSparse { grain_dir, grain_size_bytes, gt_offset_sectors } => {
+                use sesparse::SE_GTES_PER_GT;
+                let grain_idx = virtual_offset / grain_size_bytes;
+                let gd_idx = (grain_idx / SE_GTES_PER_GT) as usize;
+                let gte_idx = grain_idx % SE_GTES_PER_GT;
+                let gt_table_idx = grain_dir.get(gd_idx).copied().unwrap_or(0);
+                let gt_off = *gt_offset_sectors;
+                let _ = ();
+                if gt_table_idx == 0 { return Ok(false); }
+                let gt_sector = gt_off + (gt_table_idx - 1) * sesparse::SE_GT_SECTORS;
+                let gte_pos = gt_sector * SECTOR_SIZE + gte_idx * 8;
+                self.inner.seek(SeekFrom::Start(gte_pos))?;
+                let mut b = [0u8; 8];
+                self.inner.read_exact(&mut b)?;
+                return Ok(u64::from_le_bytes(b) != 0);
+            }
         }
-        let gte_file_pos = u64::from(gt_sector) * SECTOR_SIZE + gte_idx * 4;
-        self.inner.seek(SeekFrom::Start(gte_file_pos))?;
-        let mut gte_bytes = [0u8; 4];
-        self.inner.read_exact(&mut gte_bytes)?;
-        Ok(u32::from_le_bytes(gte_bytes) > 1)
     }
 
     /// Iterate over all allocated (non-sparse) grain ranges in LBA order.
@@ -431,6 +490,34 @@ impl<R: Read + Seek> VmdkReader<R> {
                 num_gtes_per_gt,
                 ..
             } => (grain_dir.clone(), *grain_size_bytes, *num_gtes_per_gt),
+            FormatState::SeSparse { grain_dir, grain_size_bytes, gt_offset_sectors } => {
+                // For seSparse, iterate differently: GD entries are u64 table indices.
+                let (gd, gsz, goff) =
+                    (grain_dir.clone(), *grain_size_bytes, *gt_offset_sectors);
+                let grain_sectors = gsz / SECTOR_SIZE;
+                let mut result = Vec::new();
+                for (gd_idx, &gt_table_idx) in gd.iter().enumerate() {
+                    if gt_table_idx == 0 { continue; }
+                    let gt_sector = goff + (gt_table_idx - 1) * sesparse::SE_GT_SECTORS;
+                    let gt_bytes_len = sesparse::SE_GTES_PER_GT as usize * 8;
+                    self.inner.seek(SeekFrom::Start(gt_sector * SECTOR_SIZE))?;
+                    let mut gt_bytes = vec![0u8; gt_bytes_len];
+                    self.inner.read_exact(&mut gt_bytes)?;
+                    for gte_idx in 0..sesparse::SE_GTES_PER_GT as usize {
+                        let gte = u64::from_le_bytes(
+                            gt_bytes[gte_idx * 8..gte_idx * 8 + 8].try_into().expect("8 bytes")
+                        );
+                        if gte != 0 {
+                            let grain_idx = gd_idx as u64 * sesparse::SE_GTES_PER_GT + gte_idx as u64;
+                            let start_lba = grain_idx * grain_sectors;
+                            if start_lba < self.virtual_disk_size / SECTOR_SIZE {
+                                result.push(AllocatedGrain { start_lba, sector_count: grain_sectors });
+                            }
+                        }
+                    }
+                }
+                return Ok(result);
+            }
         };
         let grain_sectors = grain_size_bytes / SECTOR_SIZE;
         let mut result = Vec::new();
@@ -508,6 +595,30 @@ impl<R: Read + Seek> VmdkReader<R> {
 
     /// Resolve `virtual_offset` to a [`GrainLookup`] describing where to find the data.
     fn grain_location(&mut self, virtual_offset: u64) -> io::Result<GrainLookup> {
+        // Dispatch seSparse separately: 8-byte GD entries + 8-byte GTEs.
+        if let FormatState::SeSparse { grain_dir, grain_size_bytes, gt_offset_sectors } = &self.fmt {
+            use sesparse::{SE_GTES_PER_GT, SE_GT_SECTORS};
+            let grain_idx = virtual_offset / grain_size_bytes;
+            let offset_in_grain = virtual_offset % grain_size_bytes;
+            let gd_idx = (grain_idx / SE_GTES_PER_GT) as usize;
+            let gte_idx = grain_idx % SE_GTES_PER_GT;
+            let gt_table_idx = grain_dir.get(gd_idx).copied().unwrap_or(0);
+            let gt_off = *gt_offset_sectors;
+            let _ = (); // end immutable borrow
+            if gt_table_idx == 0 { return Ok(GrainLookup::Sparse); }
+            let gt_sector = gt_off + (gt_table_idx - 1) * SE_GT_SECTORS;
+            let gte_pos = gt_sector * SECTOR_SIZE + gte_idx * 8;
+            self.inner.seek(SeekFrom::Start(gte_pos))?;
+            let mut b = [0u8; 8];
+            self.inner.read_exact(&mut b)?;
+            let gte = u64::from_le_bytes(b);
+            return if gte == 0 {
+                Ok(GrainLookup::Sparse)
+            } else {
+                Ok(GrainLookup::FileOffset(gte * SECTOR_SIZE + offset_in_grain))
+            };
+        }
+
         let (gt_sector, gte_idx, offset_in_grain, compressed, grain_size_bytes) = {
             let FormatState::Sparse {
                 grain_dir,
@@ -719,11 +830,10 @@ impl<R: Read + Seek> Read for VmdkReader<R> {
             return Ok(n);
         }
 
-        // Sparse / StreamOptimized: clamp at grain boundary then do GTE lookup.
+        // Sparse / StreamOptimized / SeSparse: clamp at grain boundary then do GTE lookup.
         let grain_size_bytes = match &self.fmt {
-            FormatState::Sparse {
-                grain_size_bytes, ..
-            } => *grain_size_bytes,
+            FormatState::Sparse { grain_size_bytes, .. } => *grain_size_bytes,
+            FormatState::SeSparse { grain_size_bytes, .. } => *grain_size_bytes,
             FormatState::Flat => unreachable!(),
         };
         let remaining_in_grain = (grain_size_bytes - (self.pos % grain_size_bytes)) as usize;
@@ -784,7 +894,7 @@ mod tests {
     use std::io::Cursor;
     use testutil::{
         compressed_vmdk_with_oversized_marker, gd_at_end_stream_opt_vmdk, test_cowd_vmdk,
-        test_sparse_vmdk, GRAIN_SIZE_BYTES,
+        test_sesparse_vmdk, test_sparse_vmdk, GRAIN_SIZE_BYTES,
     };
 
     fn vmdk_header_bytes(capacity_sectors: u64, grain_size: u64, num_gtes_per_gt: u32) -> Vec<u8> {
@@ -895,6 +1005,35 @@ mod tests {
             bytes.extend_from_slice(&suffix);
             let _ = VmdkReader::open(Cursor::new(bytes));
         }
+    }
+
+    // ── seSparse format (vSphere 6.5+ VMFS6) ─────────────────────────────────
+
+    #[test]
+    fn sesparse_vmdk_opens_successfully() {
+        let se = test_sesparse_vmdk(&[0u8; 512]);
+        let reader = VmdkReader::open(Cursor::new(se));
+        assert!(reader.is_ok(), "seSparse VMDK must open, got: {:?}", reader.err());
+    }
+
+    #[test]
+    fn sesparse_vmdk_disk_type_is_sesparse() {
+        let se = test_sesparse_vmdk(&[0u8; 512]);
+        let reader = VmdkReader::open(Cursor::new(se)).expect("open");
+        assert_eq!(reader.disk_type(), "seSparse");
+    }
+
+    #[test]
+    fn sesparse_vmdk_reads_grain_data() {
+        let mut data = vec![0u8; 512];
+        data[0] = 0x5E;
+        data[1] = 0xA5;
+        let se = test_sesparse_vmdk(&data);
+        let mut reader = VmdkReader::open(Cursor::new(se)).expect("open seSparse");
+        let mut buf = [0u8; 512];
+        reader.read_exact(&mut buf).expect("read");
+        assert_eq!(buf[0], 0x5E);
+        assert_eq!(buf[1], 0xA5);
     }
 
     // ── COWD format (vmfsSparse / vmfsThin) ──────────────────────────────────

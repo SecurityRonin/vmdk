@@ -73,6 +73,75 @@ pub fn test_sparse_vmdk(sector_data: &[u8]) -> Vec<u8> {
     vmdk
 }
 
+// ── seSparse test helpers ─────────────────────────────────────────────────────
+
+/// Build a minimal seSparse extent file with grain 0 containing `sector_data`.
+///
+/// Layout:
+/// Sector 0:    constant header (magic CAFEBABE, version, capacity, etc.)
+/// Sector 1:    volatile header (magic CAFECAFE) — unused but structurally required
+/// Sectors 2-9: padding to sector 10 (gd_offset)
+/// Sector 10:   GD (one u64 entry = 1, pointing to GT table index 1)
+/// Sectors 11-74: GT (index 1 = sectors 11 to 74; 64 sectors = 4096 × 8-byte GTEs)
+///              GTE[0] = sector 75 (grain data)
+/// Sector 75:   grain data (8 sectors = 4 KiB)
+#[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
+pub fn test_sesparse_vmdk(sector_data: &[u8]) -> Vec<u8> {
+    use super::sesparse::{SE_CONST_MAGIC, SE_GTES_PER_GT, SE_GT_SECTORS, SE_VERSION};
+
+    const GRAIN_SECTORS: u64 = 8;
+    const GRAIN_BYTES: usize = GRAIN_SECTORS as usize * SECTOR_SIZE as usize;
+    const GD_SECTOR: u64 = 10;
+    const GT_OFFSET: u64 = 11;   // first GT table starts at sector 11
+    const GRAIN_SECTOR: u64 = GT_OFFSET + SE_GT_SECTORS; // = 75
+    const CAPACITY: u64 = GRAIN_SECTORS; // 1 grain
+
+    let mut grain = vec![0u8; GRAIN_BYTES];
+    let copy_len = sector_data.len().min(GRAIN_BYTES);
+    grain[..copy_len].copy_from_slice(&sector_data[..copy_len]);
+
+    // Constant header (512 bytes)
+    let mut const_hdr = vec![0u8; 512];
+    const_hdr[0..8].copy_from_slice(&SE_CONST_MAGIC.to_le_bytes());
+    const_hdr[8..16].copy_from_slice(&SE_VERSION.to_le_bytes());
+    const_hdr[16..24].copy_from_slice(&CAPACITY.to_le_bytes());
+    const_hdr[24..32].copy_from_slice(&GRAIN_SECTORS.to_le_bytes()); // grain_size
+    const_hdr[32..40].copy_from_slice(&SE_GT_SECTORS.to_le_bytes()); // grain_table_size
+    const_hdr[80..88].copy_from_slice(&1u64.to_le_bytes()); // volatile hdr offset
+    const_hdr[88..96].copy_from_slice(&1u64.to_le_bytes()); // volatile hdr size
+    const_hdr[128..136].copy_from_slice(&GD_SECTOR.to_le_bytes()); // gd_offset
+    const_hdr[136..144].copy_from_slice(&1u64.to_le_bytes()); // gd_size
+    const_hdr[144..152].copy_from_slice(&GT_OFFSET.to_le_bytes()); // gt_offset
+    const_hdr[152..160].copy_from_slice(&(SE_GT_SECTORS + 1).to_le_bytes()); // gt_size
+    const_hdr[192..200].copy_from_slice(&GRAIN_SECTOR.to_le_bytes()); // grains_offset
+    const_hdr[200..208].copy_from_slice(&GRAIN_SECTORS.to_le_bytes()); // grains_size
+
+    // Volatile header (sector 1, magic CAFECAFE)
+    let mut vol_hdr = vec![0u8; 512];
+    vol_hdr[0..8].copy_from_slice(&0x0000_0000_CAFE_CAFEu64.to_le_bytes());
+
+    // Padding to sector 10
+    let padding = vec![0u8; 8 * SECTOR_SIZE as usize];
+
+    // GD at sector 10: one entry = 1 (GT table index 1)
+    let mut gd = vec![0u8; SECTOR_SIZE as usize];
+    gd[0..8].copy_from_slice(&1u64.to_le_bytes());
+
+    // GT at sectors 11-74 (64 sectors = SE_GTES_PER_GT × 8 bytes)
+    let mut gt = vec![0u8; SE_GTES_PER_GT as usize * 8];
+    // GTE[0] = grain sector = 75
+    gt[0..8].copy_from_slice(&GRAIN_SECTOR.to_le_bytes());
+
+    let mut vmdk = Vec::new();
+    vmdk.extend_from_slice(&const_hdr);
+    vmdk.extend_from_slice(&vol_hdr);
+    vmdk.extend_from_slice(&padding);
+    vmdk.extend_from_slice(&gd);
+    vmdk.extend_from_slice(&gt);
+    vmdk.extend_from_slice(&grain);
+    vmdk
+}
+
 /// Build a monolithicSparse VMDK with a custom descriptor string embedded.
 ///
 /// Used to construct snapshot chains with `parentCID` and `parentFileNameHint`.
