@@ -223,7 +223,7 @@ impl<R: Read + Seek> VmdkReader<R> {
 
     /// Resolve `virtual_offset` to a [`GrainLookup`] describing where to find the data.
     fn grain_location(&mut self, virtual_offset: u64) -> io::Result<GrainLookup> {
-        let (gt_sector, gte_idx, offset_in_grain, compressed) = {
+        let (gt_sector, gte_idx, offset_in_grain, compressed, grain_size_bytes) = {
             let FormatState::Sparse {
                 grain_dir,
                 grain_size_bytes,
@@ -238,7 +238,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             let gd_idx = (grain_idx / num_gtes_per_gt) as usize;
             let gte_idx = grain_idx % num_gtes_per_gt;
             let gt_sector = grain_dir.get(gd_idx).copied().unwrap_or(0);
-            (gt_sector, gte_idx, offset_in_grain, *compressed)
+            (gt_sector, gte_idx, offset_in_grain, *compressed, *grain_size_bytes)
         };
         if gt_sector == 0 {
             return Ok(GrainLookup::Sparse);
@@ -258,6 +258,19 @@ impl<R: Read + Seek> VmdkReader<R> {
             let mut marker_hdr = [0u8; 12];
             self.inner.read_exact(&mut marker_hdr)?;
             let data_size = u32::from_le_bytes(marker_hdr[8..12].try_into().expect("4 bytes"));
+            // Cap data_size to prevent allocation amplification from crafted markers.
+            // A legitimate compressed grain cannot expand to more than 64 KiB past the
+            // raw grain size; 65536 bytes of headroom absorbs any real compressor overhead.
+            let max_data = grain_size_bytes.saturating_add(65536);
+            if u64::from(data_size) > max_data {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "compressed grain data_size {data_size} exceeds limit {max_data}: \
+                         likely a crafted or corrupt VMDK"
+                    ),
+                ));
+            }
             return Ok(GrainLookup::Compressed {
                 data_offset: marker_offset + 12,
                 data_size,

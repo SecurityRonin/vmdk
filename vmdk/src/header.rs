@@ -61,8 +61,11 @@ impl SparseExtentHeader {
         }
 
         // Validate geometry before these values feed division arithmetic in the reader.
-        if grain_size == 0 {
-            return Err(VmdkError::InvalidGeometry("grain_size must be > 0".into()));
+        // VDF 1.1 §4.1: minimum grain size is 8 sectors (4 KiB).
+        if grain_size < 8 {
+            return Err(VmdkError::InvalidGeometry(
+                "grain_size must be >= 8 sectors per VDF 1.1 spec".into(),
+            ));
         }
         if num_gtes_per_gt == 0 {
             return Err(VmdkError::InvalidGeometry(
