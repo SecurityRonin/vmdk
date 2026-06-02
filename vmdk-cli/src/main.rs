@@ -31,10 +31,13 @@ fn open_or_die(path: &std::path::Path) -> VmdkFileReader {
 #[command(
     name = "vmdk",
     version,
-    about = "Comprehensive CLI for VMware VMDK disk images",
+    about = "Comprehensive read-only CLI for VMware VMDK disk images",
     long_about = "Read-only VMDK inspector supporting monolithicSparse, streamOptimized, \
-                  twoGbMaxExtentFlat/Sparse, monolithicFlat, COWD (vmfsSparse), \
-                  seSparse, and snapshot chains."
+                  twoGbMaxExtentFlat/Sparse, monolithicFlat, COWD (vmfsSparse/vmfsThin), \
+                  seSparse (VMFS6), and snapshot chains.\n\n\
+                  VMDK is a block container — it stores raw disk sectors, not files. \
+                  To extract individual files, pipe `dump` output (or VmdkReader) into a \
+                  filesystem tool that understands the guest filesystem (NTFS, ext4, …)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -43,40 +46,42 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Display image metadata (format, sizes, compression, CID)
-    Info { path: PathBuf },
-
-    /// Write the virtual disk as a raw flat image
-    Extract {
+    /// Show image metadata; --descriptor dumps the raw descriptor, --chain walks the snapshot chain
+    Info {
         path: PathBuf,
-        /// Output file path (default: <input>.raw)
+        /// Print the raw embedded text descriptor instead of the summary
+        #[arg(long)]
+        descriptor: bool,
+        /// Show the snapshot/delta chain (parentFileNameHint traversal)
+        #[arg(long)]
+        chain: bool,
+    },
+
+    /// List allocated (non-sparse) grain ranges as start_lba,sector_count
+    Map { path: PathBuf },
+
+    /// Output virtual disk bytes — to stdout, a file (-o), or as a hex dump (--hex)
+    Dump {
+        path: PathBuf,
+        /// Write to this file instead of stdout (raw flat image extraction)
         #[arg(short, long)]
         output: Option<PathBuf>,
-    },
-
-    /// Pipe the virtual disk bytes to stdout (for piping to xxd, strings, etc.)
-    Cat { path: PathBuf },
-
-    /// List allocated grain ranges as start_lba,sector_count pairs
-    Sectors { path: PathBuf },
-
-    /// Print the embedded text descriptor
-    Descriptor { path: PathBuf },
-
-    /// Hex dump a byte range of the virtual disk
-    Hexdump {
-        path: PathBuf,
-        /// Start byte offset
+        /// Start byte offset within the virtual disk
+        #[arg(long, default_value_t = 0)]
         offset: u64,
-        /// Number of bytes to dump
-        length: u64,
+        /// Number of bytes to output (default: to end of disk)
+        #[arg(long)]
+        length: Option<u64>,
+        /// Render as a hex dump (offset | hex bytes | ASCII) instead of raw bytes
+        #[arg(long)]
+        hex: bool,
     },
 
-    /// Verify structural integrity (RGD match, GD/GT consistency)
-    Verify { path: PathBuf },
-
-    /// Compute SHA-256 and MD5 of the full virtual disk
+    /// Compute SHA-256 and MD5 of the full virtual disk (one streaming pass)
     Hash { path: PathBuf },
+
+    /// Verify structural integrity: RGD validation + allocation scan
+    Verify { path: PathBuf },
 
     /// Byte-by-byte comparison of two VMDK virtual disks
     Diff {
@@ -85,16 +90,23 @@ enum Command {
         /// Second VMDK file
         b: PathBuf,
     },
-
-    /// Show the snapshot/delta chain (parentFileNameHint traversal)
-    SnapshotChain { path: PathBuf },
 }
 
-fn cmd_info(path: &std::path::Path) {
-    let mut reader = open_or_die(path);
+// ── info ──────────────────────────────────────────────────────────────────────
+
+fn cmd_info(path: &std::path::Path, descriptor: bool, chain: bool) {
+    if descriptor {
+        print_descriptor(path);
+        return;
+    }
+    if chain {
+        print_chain(path);
+        return;
+    }
+
+    let reader = open_or_die(path);
     let info = reader.info();
     let mib = info.virtual_disk_size as f64 / (1024.0 * 1024.0);
-
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -124,62 +136,51 @@ fn cmd_info(path: &std::path::Path) {
     }
     if !info.descriptor_text.is_empty() {
         let line_count = info.descriptor_text.lines().count();
-        println!("Descriptor:        {line_count} lines");
+        println!("Descriptor:        {line_count} lines (see --descriptor)");
     }
 }
 
-fn cmd_extract(path: &std::path::Path, output: Option<&std::path::Path>) {
-    let mut reader = open_or_die(path);
-    reader.seek(SeekFrom::Start(0)).unwrap_or_else(|e| {
-        eprintln!("seek error: {e}");
+fn print_descriptor(path: &std::path::Path) {
+    let reader = open_or_die(path);
+    let text = reader.descriptor_text();
+    if text.is_empty() {
+        eprintln!("No embedded descriptor in {}", path.display());
         process::exit(1);
-    });
-
-    let out_path = output.map(std::borrow::ToOwned::to_owned).unwrap_or_else(|| {
-        let mut p = path.to_path_buf();
-        p.set_extension("raw");
-        p
-    });
-
-    let file = std::fs::File::create(&out_path).unwrap_or_else(|e| {
-        eprintln!("cannot create {}: {e}", out_path.display());
-        process::exit(1);
-    });
-    let mut w = BufWriter::new(file);
-
-    let mut buf = vec![0u8; 65536];
-    loop {
-        let n = reader.read(&mut buf).unwrap_or_else(|e| {
-            eprintln!("read error: {e}");
-            process::exit(1);
-        });
-        if n == 0 { break; }
-        w.write_all(&buf[..n]).unwrap_or_else(|e| {
-            eprintln!("write error: {e}");
-            process::exit(1);
-        });
     }
-    eprintln!("Wrote {}", out_path.display());
+    print!("{text}");
 }
 
-fn cmd_cat(path: &std::path::Path) {
-    let mut reader = open_or_die(path);
-    reader.seek(SeekFrom::Start(0)).ok();
-    let stdout = io::stdout();
-    let w_inner = stdout.lock();
-    let mut w = BufWriter::new(w_inner); // mut needed for write_all
-    let mut buf = vec![0u8; 65536];
-    loop {
-        let n = reader.read(&mut buf).unwrap_or_else(|e| {
-            eprintln!("read error: {e}");
-            process::exit(1);
-        });
-        if n == 0 { break; }
-        w.write_all(&buf[..n]).ok();
+fn print_chain(path: &std::path::Path) {
+    match VmdkChainReader::open(path) {
+        Ok(chain) => {
+            println!("Chain depth:  {} layer(s)", chain.depth());
+            println!("Virtual size: {} bytes", fmt_commas(chain.virtual_disk_size()));
+        }
+        Err(e) => {
+            // Fall back to single-image view, reporting parentCID if present.
+            match VmdkFileReader::open_path(path) {
+                Ok(r) => {
+                    let info = r.info();
+                    println!("Chain depth:  1 layer");
+                    println!("Virtual size: {} bytes", fmt_commas(info.virtual_disk_size));
+                    if info.parent_cid != 0xffff_ffff {
+                        println!("Parent CID:   {:08x} (parent file not found: {e})", info.parent_cid);
+                    } else {
+                        println!("No parent (base image)");
+                    }
+                }
+                Err(e2) => {
+                    eprintln!("error: {e2}");
+                    process::exit(1);
+                }
+            }
+        }
     }
 }
 
-fn cmd_sectors(path: &std::path::Path) {
+// ── map ───────────────────────────────────────────────────────────────────────
+
+fn cmd_map(path: &std::path::Path) {
     let mut reader = open_or_die(path);
     let grains = reader.iter_allocated_grains().unwrap_or_else(|e| {
         eprintln!("error: {e}");
@@ -196,79 +197,108 @@ fn cmd_sectors(path: &std::path::Path) {
     eprintln!("{} allocated grain(s)", grains.len());
 }
 
-fn cmd_descriptor(path: &std::path::Path) {
-    let reader = open_or_die(path);
-    let text = reader.descriptor_text();
-    if text.is_empty() {
-        eprintln!("No embedded descriptor in {}", path.display());
-        process::exit(1);
-    }
-    print!("{text}");
-}
+// ── dump ──────────────────────────────────────────────────────────────────────
 
-fn cmd_hexdump(path: &std::path::Path, offset: u64, length: u64) {
+fn cmd_dump(
+    path: &std::path::Path,
+    output: Option<&std::path::Path>,
+    offset: u64,
+    length: Option<u64>,
+    hex: bool,
+) {
     let mut reader = open_or_die(path);
+    let disk_size = reader.virtual_disk_size();
+    let end = length.map_or(disk_size, |len| offset.saturating_add(len).min(disk_size));
+    let to_output = end.saturating_sub(offset);
+
     reader.seek(SeekFrom::Start(offset)).unwrap_or_else(|e| {
         eprintln!("seek error: {e}");
         process::exit(1);
     });
-    let mut remaining = length;
-    let mut buf = vec![0u8; 16usize.min(length as usize)];
-    let mut pos = offset;
+
+    if hex {
+        dump_hex(&mut reader, offset, to_output);
+        return;
+    }
+
+    // Raw byte output to file or stdout.
+    if let Some(out_path) = output {
+        let file = std::fs::File::create(out_path).unwrap_or_else(|e| {
+            eprintln!("cannot create {}: {e}", out_path.display());
+            process::exit(1);
+        });
+        let mut w = BufWriter::new(file);
+        copy_n(&mut reader, &mut w, to_output);
+        w.flush().ok();
+        eprintln!("Wrote {} bytes to {}", fmt_commas(to_output), out_path.display());
+    } else {
+        let stdout = io::stdout();
+        let mut w = BufWriter::new(stdout.lock());
+        copy_n(&mut reader, &mut w, to_output);
+        w.flush().ok();
+    }
+}
+
+/// Copy exactly `n` bytes from `reader` to `w`.
+fn copy_n<R: Read, W: Write>(reader: &mut R, w: &mut W, n: u64) {
+    let mut remaining = n;
+    let mut buf = vec![0u8; 65536];
     while remaining > 0 {
-        let to_read = (16u64.min(remaining)) as usize;
-        buf.resize(to_read, 0);
-        let n = reader.read(&mut buf[..to_read]).unwrap_or_else(|e| {
+        let want = (buf.len() as u64).min(remaining) as usize;
+        let got = reader.read(&mut buf[..want]).unwrap_or_else(|e| {
             eprintln!("read error: {e}");
             process::exit(1);
         });
-        if n == 0 { break; }
-        // Offset
-        print!("{pos:08x}  ");
-        // Hex bytes
+        if got == 0 {
+            break;
+        }
+        w.write_all(&buf[..got]).unwrap_or_else(|e| {
+            eprintln!("write error: {e}");
+            process::exit(1);
+        });
+        remaining -= got as u64;
+    }
+}
+
+fn dump_hex<R: Read>(reader: &mut R, start_offset: u64, length: u64) {
+    let stdout = io::stdout();
+    let mut w = BufWriter::new(stdout.lock());
+    let mut remaining = length;
+    let mut pos = start_offset;
+    let mut buf = [0u8; 16];
+    while remaining > 0 {
+        let want = (16u64.min(remaining)) as usize;
+        let n = reader.read(&mut buf[..want]).unwrap_or_else(|e| {
+            eprintln!("read error: {e}");
+            process::exit(1);
+        });
+        if n == 0 {
+            break;
+        }
+        let _ = write!(w, "{pos:08x}  ");
         for i in 0..16 {
-            if i < n { print!("{:02x} ", buf[i]); } else { print!("   "); }
-            if i == 7 { print!(" "); }
+            if i < n {
+                let _ = write!(w, "{:02x} ", buf[i]);
+            } else {
+                let _ = write!(w, "   ");
+            }
+            if i == 7 {
+                let _ = write!(w, " ");
+            }
         }
-        print!(" |");
-        // ASCII
-        for i in 0..n {
-            let c = buf[i];
-            print!("{}", if c.is_ascii_graphic() || c == b' ' { c as char } else { '.' });
+        let _ = write!(w, " |");
+        for &c in &buf[..n] {
+            let ch = if c.is_ascii_graphic() || c == b' ' { c as char } else { '.' };
+            let _ = write!(w, "{ch}");
         }
-        println!("|");
+        let _ = writeln!(w, "|");
         pos += n as u64;
         remaining = remaining.saturating_sub(n as u64);
     }
+    w.flush().ok();
 }
 
-fn cmd_verify(path: &std::path::Path) {
-    let mut reader = open_or_die(path);
-    let info = reader.info();
-    println!("File:    {}", path.display());
-    println!("Format:  {} v{}", info.disk_type, info.version);
-    println!("Size:    {} bytes", fmt_commas(info.virtual_disk_size));
-
-    // RGD validation
-    match reader.validate_rgd() {
-        Ok(true) => println!("RGD:     OK (matches primary GD)"),
-        Ok(false) => println!("RGD:     absent or not applicable"),
-        Err(e) => println!("RGD:     ERROR — {e}"),
-    }
-
-    // Allocation scan
-    match reader.iter_allocated_grains() {
-        Ok(grains) => {
-            let allocated_bytes: u64 = grains.iter()
-                .map(|g| g.sector_count * 512)
-                .sum();
-            println!("Allocated grains: {} ({} bytes)", grains.len(), fmt_commas(allocated_bytes));
-        }
-        Err(e) => println!("Allocation scan: ERROR — {e}"),
-    }
-
-    println!("Status:  OK");
-}
+// ── hash ──────────────────────────────────────────────────────────────────────
 
 fn cmd_hash(path: &std::path::Path) {
     let mut reader = open_or_die(path);
@@ -281,6 +311,38 @@ fn cmd_hash(path: &std::path::Path) {
     println!("MD5:     {}", digest.md5);
     println!("File:    {}", path.display());
 }
+
+// ── verify ────────────────────────────────────────────────────────────────────
+
+fn cmd_verify(path: &std::path::Path) {
+    let mut reader = open_or_die(path);
+    let info = reader.info();
+    println!("File:    {}", path.display());
+    println!("Format:  {} v{}", info.disk_type, info.version);
+    println!("Size:    {} bytes", fmt_commas(info.virtual_disk_size));
+
+    match reader.validate_rgd() {
+        Ok(true) => println!("RGD:     OK (matches primary GD)"),
+        Ok(false) => println!("RGD:     absent or not applicable"),
+        Err(e) => println!("RGD:     ERROR — {e}"),
+    }
+
+    match reader.iter_allocated_grains() {
+        Ok(grains) => {
+            let allocated_bytes: u64 = grains.iter().map(|g| g.sector_count * 512).sum();
+            println!(
+                "Allocated grains: {} ({} bytes)",
+                grains.len(),
+                fmt_commas(allocated_bytes)
+            );
+        }
+        Err(e) => println!("Allocation scan: ERROR — {e}"),
+    }
+
+    println!("Status:  OK");
+}
+
+// ── diff ──────────────────────────────────────────────────────────────────────
 
 fn cmd_diff(a: &std::path::Path, b: &std::path::Path) {
     let mut ra = open_or_die(a);
@@ -302,7 +364,9 @@ fn cmd_diff(a: &std::path::Path, b: &std::path::Path) {
     loop {
         let na = ra.read(&mut buf_a).unwrap_or(0);
         let nb = rb.read(&mut buf_b).unwrap_or(0);
-        if na == 0 && nb == 0 { break; }
+        if na == 0 && nb == 0 {
+            break;
+        }
         let n = na.min(nb);
         for i in 0..n {
             if buf_a[i] != buf_b[i] {
@@ -327,46 +391,16 @@ fn cmd_diff(a: &std::path::Path, b: &std::path::Path) {
     }
 }
 
-fn cmd_snapshot_chain(path: &std::path::Path) {
-    match VmdkChainReader::open(path) {
-        Ok(chain) => {
-            println!("Chain depth: {} layer(s)", chain.depth());
-            println!("Virtual size: {} bytes", fmt_commas(chain.virtual_disk_size()));
-        }
-        Err(e) => {
-            // If the chain reader fails, try reading as a single image and report parentCID.
-            match VmdkFileReader::open_path(path) {
-                Ok(r) => {
-                    let info = r.info();
-                    println!("Chain depth: 1 layer");
-                    println!("Virtual size: {} bytes", fmt_commas(info.virtual_disk_size));
-                    if info.parent_cid != 0xffff_ffff {
-                        println!("Parent CID: {:08x} (parent file not found: {e})", info.parent_cid);
-                    } else {
-                        println!("No parent (base image)");
-                    }
-                }
-                Err(e2) => {
-                    eprintln!("error: {e2}");
-                    process::exit(1);
-                }
-            }
-        }
-    }
-}
-
 fn main() {
     let cli = Cli::parse();
     match &cli.command {
-        Command::Info { path } => cmd_info(path),
-        Command::Extract { path, output } => cmd_extract(path, output.as_deref()),
-        Command::Cat { path } => cmd_cat(path),
-        Command::Sectors { path } => cmd_sectors(path),
-        Command::Descriptor { path } => cmd_descriptor(path),
-        Command::Hexdump { path, offset, length } => cmd_hexdump(path, *offset, *length),
-        Command::Verify { path } => cmd_verify(path),
+        Command::Info { path, descriptor, chain } => cmd_info(path, *descriptor, *chain),
+        Command::Map { path } => cmd_map(path),
+        Command::Dump { path, output, offset, length, hex } => {
+            cmd_dump(path, output.as_deref(), *offset, *length, *hex);
+        }
         Command::Hash { path } => cmd_hash(path),
+        Command::Verify { path } => cmd_verify(path),
         Command::Diff { a, b } => cmd_diff(a, b),
-        Command::SnapshotChain { path } => cmd_snapshot_chain(path),
     }
 }
