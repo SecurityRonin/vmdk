@@ -17,7 +17,7 @@ repos:
 
       - id: cargo-test
         name: cargo test (unit)
-        entry: cargo test --lib
+        entry: cargo test --lib --test real_images --test synthetic
         language: system
         types: [rust]
         pass_filenames: false

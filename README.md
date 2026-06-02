@@ -1,36 +1,44 @@
 [![Crates.io](https://img.shields.io/crates/v/vmdk.svg)](https://crates.io/crates/vmdk)
-[![Docs.rs](https://img.shields.io/docsrs/vmdk)](https://docs.rs/vmdk)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/SecurityRonin/vmdk/actions/workflows/ci.yml/badge.svg)](https://github.com/SecurityRonin/vmdk/actions/workflows/ci.yml)
+[![docs.rs](https://img.shields.io/docsrs/vmdk)](https://docs.rs/vmdk)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/SecurityRonin/vmdk/actions/workflows/ci.yml/badge.svg)](https://github.com/SecurityRonin/vmdk/actions)
 [![Sponsor](https://img.shields.io/badge/sponsor-h4x0r-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/h4x0r)
 
-**Pure-Rust read-only VMware VMDK sparse disk image reader.**
+**Pure-Rust read-only VMware VMDK disk image reader — `Read + Seek` over the virtual sector stream.**
 
-Decodes monolithic sparse VMDK containers (VMware Workstation, Fusion, and ESXi-exported images)
-and exposes a `Read + Seek` interface over the virtual sector stream. Navigates the two-level
-grain directory / grain table structure to resolve virtual offsets to raw grain data.
-Zero unsafe code, no C bindings.
+## Install
+
+### CLI
+
+```bash
+cargo install vmdk-cli
+```
+
+### Rust library
 
 ```toml
 [dependencies]
 vmdk = "0.1"
 ```
 
----
+## CLI usage
 
-## Usage
+```bash
+vmdk info disk.vmdk          # Format, virtual disk size, sector size
+```
 
-### Library
+## Library quick start
 
 ```rust
 use vmdk::VmdkReader;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
+// Single-file VMDKs (monolithicSparse, streamOptimized)
 let file = File::open("disk.vmdk")?;
 let mut reader = VmdkReader::open(file)?;
 
-println!("Disk type:         {}", reader.disk_type());        // "monolithicSparse"
+println!("Disk type:         {}", reader.disk_type());         // "monolithicSparse"
 println!("Virtual disk size: {}", reader.virtual_disk_size()); // bytes
 
 // Read the first sector
@@ -42,65 +50,75 @@ reader.seek(SeekFrom::Start(1_048_576))?;
 ```
 
 `VmdkReader<R>` is generic over any `R: Read + Seek`, so it works with `File`,
-`Cursor<Vec<u8>>`, or any custom reader:
+`Cursor<Vec<u8>>`, network streams, or any custom reader:
 
 ```rust
 // In-memory (tests, embedded use)
 use std::io::Cursor;
 let reader = VmdkReader::open(Cursor::new(bytes))?;
+```
 
-// Pass directly to a filesystem crate
-let reader = VmdkReader::open(File::open("disk.vmdk")?)?;
+Multi-file VMDKs (flat extents) require a filesystem path:
+
+```rust
+// twoGbMaxExtentFlat — descriptor + companion extent files
+let reader = VmdkReader::open_path(std::path::Path::new("disk.vmdk"))?;
+```
+
+`VmdkReader` implements `Read + Seek`, so it plugs directly into filesystem crates:
+
+```rust
 // e.g. ext4::Filesystem::open(reader)?;
+// e.g. ntfs::Ntfs::new(&mut reader)?;
 ```
 
-### CLI
+## Library features
 
-The `vmdk-cli` crate ships a `vmdk` binary:
+- **monolithicSparse** — VMware Workstation / Fusion / ESXi sparse images; two-level GD/GT grain lookup
+- **streamOptimized (v3)** — QEMU-generated empty sparse disks; header version 3 + compress=1; all-sparse grains read as zeros without DEFLATE
+- **twoGbMaxExtentFlat** — multi-file flat extent descriptors; opens via `open_path`, which resolves extent files relative to the descriptor
+- **O(1) virtual offset resolution** — GD loaded at open, one GT read + one seek per grain access
+- **Graceful rejection** — unsupported formats (`twoGbMaxExtentSparse`, compressed grains, bad magic) return `Err`, never panic
+- **Fuzz-hardened** — proptest + cargo-fuzz; all corpus inputs verified not to panic
+- **Zero unsafe code** — `#![forbid(unsafe_code)]`
+- **MIT licensed** — no GPL, safe for proprietary DFIR tooling
 
-```
-$ vmdk info disk.vmdk
-File:              disk.vmdk
-Format:            VMDK v1 (monolithicSparse)
-Virtual disk size: 4,194,304 bytes (4.00 MiB)
-Sector size:       512 bytes
-```
-
-Unsupported formats (stream-optimized, flat extents) print an error to stderr and
-exit with a non-zero status.
-
----
-
-## Supported formats
+## Format support
 
 | Format | Status |
 |--------|:------:|
-| Monolithic sparse (`monolithicSparse`) | ✓ |
-| VMware Workstation / Fusion native | ✓ |
-| ESXi-exported sparse | ✓ |
-| Flat extent (`twoGbMaxExtentFlat`, `monolithicFlat`) | — planned |
-| Stream-optimised (`streamOptimized`) | — planned |
+| `monolithicSparse` (v1) | ✓ |
+| `streamOptimized` (v3, all-sparse) | ✓ |
+| `twoGbMaxExtentFlat` | ✓ (`open_path` only) |
+| `twoGbMaxExtentSparse` | Err (planned) |
+| `monolithicFlat` | Err (planned) |
+| Compressed grains (allocated streamOptimized) | Err (planned) |
 
-Read-only. Multi-extent flat and stream-optimised VMDKs are not yet supported;
-`VmdkReader::open` returns `Err` (never panics) on unsupported inputs.
-
----
+`VmdkReader::open` and `open_path` return `Err` (never panic) on unsupported inputs.
 
 ## Format overview
 
 ```
-byte 0        SparseExtentHeader (512 bytes)
-sector 1–20   embedded text descriptor (createType, CID, extent map)
-sector 21–25  redundant grain directory (not used)
+byte 0        SparseExtentHeader (512 bytes) — magic, version, geometry, GD offset
+sector 1–20   embedded text descriptor — createType, CID, extent map
+sector 21–25  redundant grain directory (ignored)
 sector 26     primary grain directory — one u32 per grain table
-sector 27+    grain tables — one u32 (sector offset) per grain
-sector 128+   grain data — raw 64 KiB blocks of virtual sector content
+sector 27+    grain tables — one u32 (file sector offset) per grain
+sector 128+   grain data — raw 64 KiB blocks
 ```
 
-Virtual offset resolution is O(1): one GD lookup (in-memory) + one GT read (4 bytes)
-+ one grain data seek.
+Virtual offset resolution is O(1): one GD lookup (in-memory `Vec<u32>`) + one GT read
+(4 bytes from file) + one grain data seek.
 
----
+## Testing
+
+- **57 tests** across 7 suites (unit, integration, fuzz seeds, corpus differential)
+- Validated against real VMware-generated images from the [dfvfs](https://github.com/log2timeline/dfvfs)
+  and [plaso](https://github.com/log2timeline/plaso) forensics test corpora
+- External validation against pWnOS v2.0 (VulnHub, VMware Workstation 7, 40 GiB sparse image)
+  and Metasploitable3 Windows 2008 (Rapid7, VMware Workstation 13, `twoGbMaxExtentSparse`)
+
+See [docs/corpus-validation.md](docs/corpus-validation.md) for detailed results and reproduction steps.
 
 ## Related crates
 
