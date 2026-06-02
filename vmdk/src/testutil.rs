@@ -214,7 +214,10 @@ pub fn write_chain_to_dir(
     let base_desc = "# Disk DescriptorFile\nversion=1\nCID=00000001\nparentCID=ffffffff\ncreateType=\"monolithicSparse\"\n";
     let base_bytes = test_sparse_vmdk_with_descriptor(base_data, base_desc);
     let base_path = dir.join("base.vmdk");
-    std::fs::File::create(&base_path).unwrap().write_all(&base_bytes).unwrap();
+    std::fs::File::create(&base_path)
+        .unwrap()
+        .write_all(&base_bytes)
+        .unwrap();
 
     // Delta has grain 0 sparse (all-zeros grain table) so reads fall through to base.
     let delta_desc = "# Disk DescriptorFile\nversion=1\nCID=00000002\nparentCID=00000001\nparentFileNameHint=\"base.vmdk\"\ncreateType=\"monolithicSparse\"\n";
@@ -226,7 +229,10 @@ pub fn write_chain_to_dir(
     let gt_offset = (GT_SECTOR as usize) * SECTOR_SIZE as usize;
     delta_bytes[gt_offset..gt_offset + 4].copy_from_slice(&0u32.to_le_bytes());
     let delta_path = dir.join("delta.vmdk");
-    std::fs::File::create(&delta_path).unwrap().write_all(&delta_bytes).unwrap();
+    std::fs::File::create(&delta_path)
+        .unwrap()
+        .write_all(&delta_bytes)
+        .unwrap();
 
     (base_path, delta_path)
 }
@@ -327,8 +333,8 @@ fn write_stream_opt_hdr(h: &mut [u8; 512], gd_off: u64) {
 // Sector 26   : GD[0] = 27
 // Sector 27   : GT[0] = 128
 // Sector 128  : GrainMarker { lba=0 (8 B), data_size (4 B) }  — no payload follows
-const COM_CAPACITY: u64 = 128;    // virtual disk sectors (64 KiB)
-const COM_GRAIN_SIZE: u64 = 128;  // grain_size sectors   (64 KiB)
+const COM_CAPACITY: u64 = 128; // virtual disk sectors (64 KiB)
+const COM_GRAIN_SIZE: u64 = 128; // grain_size sectors   (64 KiB)
 const COM_NUM_GTES: u32 = 512;
 const COM_GD_SECTOR: u64 = 26;
 const COM_GT_SECTOR: u64 = 27;
@@ -398,7 +404,9 @@ pub fn gd_at_end_stream_opt_vmdk() -> Vec<u8> {
     // Sectors 1–20: descriptor.
     let desc = b"# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType=\"streamOptimized\"\n";
     let desc_start = GAE_DESC_OFFSET as usize * SECTOR_SIZE as usize;
-    let copy_len = desc.len().min(GAE_DESC_SIZE as usize * SECTOR_SIZE as usize);
+    let copy_len = desc
+        .len()
+        .min(GAE_DESC_SIZE as usize * SECTOR_SIZE as usize);
     vmdk[desc_start..desc_start + copy_len].copy_from_slice(&desc[..copy_len]);
 
     // Sectors 21–24: GT (all zeros → all-sparse; already zeroed).

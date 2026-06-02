@@ -66,7 +66,10 @@ impl VmdkChainReader {
             }
 
             // Resolve the parent path relative to the current file's directory.
-            let desc_text = layers.last().map(|r| r.descriptor_text().to_owned()).unwrap_or_default();
+            let desc_text = layers
+                .last()
+                .map(|r| r.descriptor_text().to_owned())
+                .unwrap_or_default();
             let parent_hint = extract_parent_file_name(&desc_text);
             if parent_hint.is_empty() {
                 break; // no hint available — treat as base
@@ -83,7 +86,11 @@ impl VmdkChainReader {
         }
 
         let virtual_disk_size = layers.first().map(|r| r.virtual_disk_size()).unwrap_or(0);
-        Ok(VmdkChainReader { layers, virtual_disk_size, pos: 0 })
+        Ok(VmdkChainReader {
+            layers,
+            virtual_disk_size,
+            pos: 0,
+        })
     }
 
     /// Total virtual disk size in bytes (from the delta/top layer).
@@ -133,7 +140,10 @@ impl Seek for VmdkChainReader {
             SeekFrom::End(n) => self.virtual_disk_size as i64 + n,
         };
         if new_pos < 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek before start"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
         }
         self.pos = new_pos as u64;
         Ok(self.pos)
@@ -198,7 +208,11 @@ mod tests {
         chain.seek(SeekFrom::Start(0)).expect("seek");
         let mut buf = [0u8; 2];
         chain.read_exact(&mut buf).expect("read");
-        assert_eq!(buf, [0xDE, 0xAD], "chain must fall through to base data for sparse delta grain");
+        assert_eq!(
+            buf,
+            [0xDE, 0xAD],
+            "chain must fall through to base data for sparse delta grain"
+        );
     }
 
     #[test]

@@ -79,7 +79,10 @@ fn info_errors_on_missing_file() {
         .args(["info", "nonexistent.vmdk"])
         .output()
         .expect("vmdk binary must run");
-    assert!(!out.status.success(), "should exit non-zero for missing file");
+    assert!(
+        !out.status.success(),
+        "should exit non-zero for missing file"
+    );
 }
 
 #[test]
@@ -153,7 +156,9 @@ fn map_all_sparse_shows_no_allocated() {
     assert!(out.status.success(), "exit: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("start_lba") || stdout.contains("No allocated") || stdout.contains("sparse"),
+        stdout.contains("start_lba")
+            || stdout.contains("No allocated")
+            || stdout.contains("sparse"),
         "got: {stdout}"
     );
 }
@@ -183,19 +188,37 @@ fn dump_to_stdout_outputs_disk_bytes() {
         .expect("vmdk dump must run");
     assert!(out.status.success(), "exit: {}", out.status);
     // minimal.vmdk is 1 MiB all-zeros → stdout should be 1,048,576 zero bytes
-    assert_eq!(out.stdout.len(), 1_048_576, "dump must emit full virtual disk to stdout");
-    assert!(out.stdout.iter().all(|&b| b == 0), "all-sparse disk must dump as zeros");
+    assert_eq!(
+        out.stdout.len(),
+        1_048_576,
+        "dump must emit full virtual disk to stdout"
+    );
+    assert!(
+        out.stdout.iter().all(|&b| b == 0),
+        "all-sparse disk must dump as zeros"
+    );
 }
 
 #[test]
 fn dump_hex_flag_outputs_hex() {
     let out = vmdk_bin()
-        .args(["dump", "--hex", "--offset", "0", "--length", "32", &data_path("dfvfs_ext2.vmdk")])
+        .args([
+            "dump",
+            "--hex",
+            "--offset",
+            "0",
+            "--length",
+            "32",
+            &data_path("dfvfs_ext2.vmdk"),
+        ])
         .output()
         .expect("vmdk dump --hex must run");
     assert!(out.status.success(), "exit: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("00000000"), "expected hex offset column, got: {stdout}");
+    assert!(
+        stdout.contains("00000000"),
+        "expected hex offset column, got: {stdout}"
+    );
 }
 
 #[test]
@@ -249,7 +272,10 @@ fn hash_produces_sha256_and_md5() {
         .expect("vmdk hash must run");
     assert!(out.status.success(), "exit: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("SHA-256"), "expected SHA-256 line, got: {stdout}");
+    assert!(
+        stdout.contains("SHA-256"),
+        "expected SHA-256 line, got: {stdout}"
+    );
     assert!(stdout.contains("MD5"), "expected MD5 line, got: {stdout}");
 }
 
@@ -277,7 +303,10 @@ fn verify_minimal_vmdk_exits_ok() {
         .expect("vmdk verify must run");
     assert!(out.status.success(), "exit: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("OK"), "expected OK in verify output, got: {stdout}");
+    assert!(
+        stdout.contains("OK"),
+        "expected OK in verify output, got: {stdout}"
+    );
 }
 
 // ── diff ──────────────────────────────────────────────────────────────────────
@@ -291,7 +320,10 @@ fn diff_identical_vmdk_reports_identical() {
         .expect("vmdk diff must run");
     assert!(out.status.success(), "exit: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("IDENTICAL"), "expected IDENTICAL, got: {stdout}");
+    assert!(
+        stdout.contains("IDENTICAL"),
+        "expected IDENTICAL, got: {stdout}"
+    );
 }
 
 #[test]

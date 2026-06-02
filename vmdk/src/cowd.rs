@@ -56,10 +56,15 @@ impl CowdHeader {
         let capacity = u32::from_le_bytes(data[12..16].try_into().expect("4 bytes"));
         let grain_size = u32::from_le_bytes(data[16..20].try_into().expect("4 bytes"));
         if grain_size == 0 {
-            return Err(VmdkError::InvalidGeometry("COWD grain_size must be > 0".into()));
+            return Err(VmdkError::InvalidGeometry(
+                "COWD grain_size must be > 0".into(),
+            ));
         }
 
-        Ok(CowdHeader { capacity, grain_size })
+        Ok(CowdHeader {
+            capacity,
+            grain_size,
+        })
     }
 }
 
@@ -67,9 +72,7 @@ impl CowdHeader {
 ///
 /// Returns `(grain_dir, grain_size_bytes)` where `grain_dir[i]` is the sector
 /// offset of the grain table for the i-th group of `COWD_GTES_PER_GT` grains.
-pub(crate) fn open_cowd<R: Read + Seek>(
-    mut reader: R,
-) -> Result<(Vec<u32>, u64), VmdkError> {
+pub(crate) fn open_cowd<R: Read + Seek>(mut reader: R) -> Result<(Vec<u32>, u64), VmdkError> {
     let mut hdr_bytes = [0u8; 512];
     reader.read_exact(&mut hdr_bytes)?;
     let hdr = CowdHeader::parse(&hdr_bytes)?;
@@ -78,16 +81,19 @@ pub(crate) fn open_cowd<R: Read + Seek>(
         .checked_mul(SECTOR_SIZE)
         .ok_or_else(|| VmdkError::InvalidGeometry("COWD grain_size overflow".into()))?;
 
-    let num_grains = (u64::from(hdr.capacity) + u64::from(hdr.grain_size) - 1)
-        / u64::from(hdr.grain_size);
+    let num_grains =
+        (u64::from(hdr.capacity) + u64::from(hdr.grain_size) - 1) / u64::from(hdr.grain_size);
     let num_gts = (num_grains + COWD_GTES_PER_GT as u64 - 1) / COWD_GTES_PER_GT as u64;
 
     let gd_bytes = num_gts
         .checked_mul(4)
-        .ok_or_else(|| VmdkError::InvalidGeometry("COWD GD too large".into()))? as usize;
+        .ok_or_else(|| VmdkError::InvalidGeometry("COWD GD too large".into()))?
+        as usize;
     const MAX_COWD_GD: usize = 16 * 1024 * 1024;
     if gd_bytes > MAX_COWD_GD {
-        return Err(VmdkError::InvalidGeometry("COWD grain directory too large".into()));
+        return Err(VmdkError::InvalidGeometry(
+            "COWD grain directory too large".into(),
+        ));
     }
 
     let gd_offset = u64::from(COWD_GD_SECTOR) * SECTOR_SIZE;
@@ -148,19 +154,25 @@ mod tests {
     fn cowd_header_wrong_version_rejected() {
         let mut h = make_cowd_header(1024, 8, 1);
         h[4..8].copy_from_slice(&2u32.to_le_bytes()); // version=2
-        assert!(matches!(CowdHeader::parse(&h), Err(VmdkError::UnsupportedVersion(2))));
+        assert!(matches!(
+            CowdHeader::parse(&h),
+            Err(VmdkError::UnsupportedVersion(2))
+        ));
     }
 
     #[test]
     fn cowd_header_zero_grain_rejected() {
         let h = make_cowd_header(1024, 0, 1);
-        assert!(matches!(CowdHeader::parse(&h), Err(VmdkError::InvalidGeometry(_))));
+        assert!(matches!(
+            CowdHeader::parse(&h),
+            Err(VmdkError::InvalidGeometry(_))
+        ));
     }
 
     #[test]
     fn open_cowd_all_sparse_returns_empty_gd() {
         // Build a minimal COWD: header + 3 empty sectors + GD (at sector 4) with one zero entry.
-        let capacity = 8u32;   // 8 sectors = 1 grain
+        let capacity = 8u32; // 8 sectors = 1 grain
         let grain_size = 8u32;
         let h = make_cowd_header(capacity, grain_size, 1);
         let mut bytes = h;

@@ -33,12 +33,30 @@ pub const SE_GTES_PER_GT: u64 = 4096;
 
 const SECTOR_SIZE: u64 = 512;
 
+// ── Grain-entry encoding (see sesparse-encoding memory; QEMU block/vmdk.c) ────
+/// L1 (GD) allocated marker: high 32 bits of an allocated GD entry.
+pub const SE_GD_ALLOC_MASK: u64 = 0xffff_ffff_0000_0000;
+pub const SE_GD_ALLOC_FLAG: u64 = 0x1000_0000_0000_0000;
+/// L1 low 32 bits hold the grain-table index.
+pub const SE_GD_INDEX_MASK: u64 = 0x0000_0000_ffff_ffff;
+/// L2 (GTE) top-nibble type field.
+pub const SE_GTE_TYPE_MASK: u64 = 0xf000_0000_0000_0000;
+pub const SE_GTE_TYPE_ALLOCATED: u64 = 0x3000_0000_0000_0000;
+pub const SE_GTE_TYPE_UNMAPPED: u64 = 0x1000_0000_0000_0000; // read as zero
+pub const SE_GTE_TYPE_ZERO: u64 = 0x2000_0000_0000_0000; // read as zero
+
+/// Decode an allocated L2 (GTE) entry into a grain index (bit-rotated layout).
+pub fn se_gte_grain_index(gte: u64) -> u64 {
+    ((gte & 0x0fff_0000_0000_0000) >> 48) | ((gte & 0x0000_ffff_ffff_ffff) << 12)
+}
+
 /// Parsed seSparse constant header (first 512 bytes of the extent file).
 pub(crate) struct SeConstHeader {
-    pub capacity: u64,   // virtual disk size in sectors
-    pub grain_size: u64, // must be 8
-    pub gd_offset: u64,  // grain directory sector offset
-    pub gt_offset: u64,  // start of grain tables (sectors)
+    pub capacity: u64,      // virtual disk size in sectors
+    pub grain_size: u64,    // must be 8
+    pub gd_offset: u64,     // grain directory sector offset
+    pub gt_offset: u64,     // start of grain tables (sectors)
+    pub grains_offset: u64, // start of grain data (sectors)
 }
 
 impl SeConstHeader {
@@ -58,31 +76,35 @@ impl SeConstHeader {
         let capacity = u64::from_le_bytes(data[16..24].try_into().expect("8 bytes"));
         let grain_size = u64::from_le_bytes(data[24..32].try_into().expect("8 bytes"));
         if grain_size != SE_GRAIN_SECTORS {
-            return Err(VmdkError::InvalidGeometry(
-                format!("seSparse grain_size must be {SE_GRAIN_SECTORS}, got {grain_size}"),
-            ));
+            return Err(VmdkError::InvalidGeometry(format!(
+                "seSparse grain_size must be {SE_GRAIN_SECTORS}, got {grain_size}"
+            )));
         }
         let grain_table_size = u64::from_le_bytes(data[32..40].try_into().expect("8 bytes"));
         if grain_table_size != SE_GT_SECTORS {
-            return Err(VmdkError::InvalidGeometry(
-                format!("seSparse grain_table_size must be {SE_GT_SECTORS}, got {grain_table_size}"),
-            ));
+            return Err(VmdkError::InvalidGeometry(format!(
+                "seSparse grain_table_size must be {SE_GT_SECTORS}, got {grain_table_size}"
+            )));
         }
-        // Wire layout also carries gd_size (136), grain_table_size validated above (32),
-        // and grains_offset (192); none are needed for read-only navigation.
-        // Grain directory offset at offset 128; grain tables at offset 144.
+        // Grain directory offset @128; grain tables @144; grain data @192 (all sectors).
         let gd_offset = u64::from_le_bytes(data[128..136].try_into().expect("8 bytes"));
         let gt_offset = u64::from_le_bytes(data[144..152].try_into().expect("8 bytes"));
+        let grains_offset = u64::from_le_bytes(data[192..200].try_into().expect("8 bytes"));
 
-        Ok(SeConstHeader { capacity, grain_size, gd_offset, gt_offset })
+        Ok(SeConstHeader {
+            capacity,
+            grain_size,
+            gd_offset,
+            gt_offset,
+            grains_offset,
+        })
     }
 }
 
 /// Open a seSparse extent file, loading the grain directory into memory.
 ///
-/// Returns `(grain_dir, grain_size_bytes, num_gtes_per_gt)`.
-/// `grain_dir[i]` is the grain table index (not sector offset) for that GD slot,
-/// or 0 if the slot is empty (all grains in that group are sparse).
+/// Returns `(grain_dir, grain_size_bytes, grains_offset_sectors)`.
+/// `grain_dir[i]` holds the raw L1 entry (nibble-encoded) for that GD slot.
 pub(crate) fn open_sesparse<R: Read + Seek>(
     mut reader: R,
 ) -> Result<(Vec<u64>, u64, u64), VmdkError> {
@@ -95,11 +117,15 @@ pub(crate) fn open_sesparse<R: Read + Seek>(
     // The number of GD entries = ceil(num_grains / GTES_PER_GT).
     let num_grains = (hdr.capacity + hdr.grain_size - 1) / hdr.grain_size;
     let num_gts = (num_grains + SE_GTES_PER_GT - 1) / SE_GTES_PER_GT;
+    // At least one GD entry even for a sub-grain-table-sized disk.
+    let num_gts = num_gts.max(1);
 
     let gd_bytes = num_gts * 8; // 8 bytes per GD entry (u64)
     const MAX_SESP_GD: u64 = 16 * 1024 * 1024;
     if gd_bytes > MAX_SESP_GD {
-        return Err(VmdkError::InvalidGeometry("seSparse grain directory too large".into()));
+        return Err(VmdkError::InvalidGeometry(
+            "seSparse grain directory too large".into(),
+        ));
     }
 
     let gd_offset_bytes = hdr.gd_offset * SECTOR_SIZE;
@@ -112,12 +138,13 @@ pub(crate) fn open_sesparse<R: Read + Seek>(
         .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
         .collect();
 
-    Ok((grain_dir, grain_size_bytes, SE_GTES_PER_GT))
+    Ok((grain_dir, grain_size_bytes, hdr.grains_offset))
 }
 
-// seSparse GTE lookups are handled inline in lib.rs `grain_location` (8-byte GTEs,
-// GT table index resolved via gt_offset + (idx-1)*SE_GT_SECTORS), so no separate
-// lookup helper is needed here.
+// seSparse GTE lookups are handled inline in lib.rs `grain_location` /
+// `se_read_gte`: the GD entry's allocated nibble (0x1) is checked, the GT table
+// index is its low 32 bits (GT sector = gt_offset + idx*SE_GT_SECTORS), and the
+// allocated (0x3) GTE's grain index is bit-rotated via `se_gte_grain_index`.
 
 #[cfg(test)]
 mod tests {
@@ -129,12 +156,12 @@ mod tests {
         h[8..16].copy_from_slice(&SE_VERSION.to_le_bytes());
         h[16..24].copy_from_slice(&capacity.to_le_bytes());
         h[24..32].copy_from_slice(&SE_GRAIN_SECTORS.to_le_bytes()); // grain_size = 8
-        h[32..40].copy_from_slice(&SE_GT_SECTORS.to_le_bytes());    // grain_table_size = 64
-        // volatile header offset (80): just put 2
+        h[32..40].copy_from_slice(&SE_GT_SECTORS.to_le_bytes()); // grain_table_size = 64
+                                                                 // volatile header offset (80): just put 2
         h[80..88].copy_from_slice(&2u64.to_le_bytes());
         // gd_offset at 128
         h[128..136].copy_from_slice(&10u64.to_le_bytes()); // GD at sector 10
-        // gd_size at 136
+                                                           // gd_size at 136
         h[136..144].copy_from_slice(&1u64.to_le_bytes());
         // gt_offset at 144
         h[144..152].copy_from_slice(&11u64.to_le_bytes());
@@ -163,13 +190,19 @@ mod tests {
     fn sesparse_wrong_version_rejected() {
         let mut h = make_sesparse_header(8);
         h[8..16].copy_from_slice(&0u64.to_le_bytes()); // wrong version
-        assert!(matches!(SeConstHeader::parse(&h), Err(VmdkError::UnsupportedVersion(_))));
+        assert!(matches!(
+            SeConstHeader::parse(&h),
+            Err(VmdkError::UnsupportedVersion(_))
+        ));
     }
 
     #[test]
     fn sesparse_wrong_grain_size_rejected() {
         let mut h = make_sesparse_header(8);
         h[24..32].copy_from_slice(&16u64.to_le_bytes()); // grain_size=16, not 8
-        assert!(matches!(SeConstHeader::parse(&h), Err(VmdkError::InvalidGeometry(_))));
+        assert!(matches!(
+            SeConstHeader::parse(&h),
+            Err(VmdkError::InvalidGeometry(_))
+        ));
     }
 }

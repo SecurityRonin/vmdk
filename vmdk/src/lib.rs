@@ -25,7 +25,7 @@ pub use error::VmdkError;
 
 use descriptor::parse_text_descriptor;
 use flat::MultiExtentReader;
-use header::{GD_AT_END, SparseExtentHeader, SECTOR_SIZE};
+use header::{SparseExtentHeader, GD_AT_END, SECTOR_SIZE};
 use sparse_multi::MultiSparseReader;
 
 // ── Public API types ──────────────────────────────────────────────────────────
@@ -107,11 +107,15 @@ enum FormatState {
         /// `true` for stream-optimised VMDKs: allocated grains carry a zlib-wrapped payload.
         compressed: bool,
     },
-    /// seSparse (vSphere 6.5+, VMFS6): 8-byte GD entries and 8-byte GTEs.
+    /// seSparse (vSphere 6.5+, VMFS6): nibble-typed, bit-rotated 8-byte grain entries.
     SeSparse {
+        /// Raw L1 (grain directory) entries — high nibble 0x1 = allocated, low 32 bits = GT index.
         grain_dir: Vec<u64>,
         grain_size_bytes: u64,
+        /// First sector of the grain-table region (`grain_tables_offset`).
         gt_offset_sectors: u64,
+        /// First sector of the grain-data region (`grains_offset`).
+        grains_offset_sectors: u64,
     },
     /// Raw flat extents — reads pass through directly to the inner reader.
     Flat,
@@ -199,9 +203,7 @@ fn read_descriptor<R: Read + Seek>(
     reader.read_exact(&mut buf)?;
 
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let text = std::str::from_utf8(&buf[..end])
-        .unwrap_or("")
-        .to_owned();
+    let text = std::str::from_utf8(&buf[..end]).unwrap_or("").to_owned();
     descriptor::parse_text_descriptor(&text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
@@ -370,12 +372,18 @@ impl<R: Read + Seek> VmdkReader<R> {
     /// Structured snapshot of all metadata for this image.
     pub fn info(&self) -> VmdkInfo {
         let (grain_size_sectors, grain_size_bytes, compressed) = match &self.fmt {
-            FormatState::Sparse { grain_size_bytes, compressed, .. } => {
-                (*grain_size_bytes / SECTOR_SIZE, *grain_size_bytes, *compressed)
-            }
-            FormatState::SeSparse { grain_size_bytes, .. } => {
-                (*grain_size_bytes / SECTOR_SIZE, *grain_size_bytes, false)
-            }
+            FormatState::Sparse {
+                grain_size_bytes,
+                compressed,
+                ..
+            } => (
+                *grain_size_bytes / SECTOR_SIZE,
+                *grain_size_bytes,
+                *compressed,
+            ),
+            FormatState::SeSparse {
+                grain_size_bytes, ..
+            } => (*grain_size_bytes / SECTOR_SIZE, *grain_size_bytes, false),
             FormatState::Flat => (0, 0, false),
         };
         VmdkInfo {
@@ -398,10 +406,11 @@ impl<R: Read + Seek> VmdkReader<R> {
     fn open_sesparse(mut reader: R, hdr_bytes: &[u8]) -> Result<Self, VmdkError> {
         use sesparse::open_sesparse;
         reader.seek(SeekFrom::Start(0))?;
-        let (grain_dir, grain_size_bytes, _gtes) = open_sesparse(&mut reader)?;
+        let (grain_dir, grain_size_bytes, grains_offset_sectors) = open_sesparse(&mut reader)?;
 
         let se_hdr = sesparse::SeConstHeader::parse(hdr_bytes)?;
-        let virtual_disk_size = se_hdr.capacity
+        let virtual_disk_size = se_hdr
+            .capacity
             .checked_mul(SECTOR_SIZE)
             .ok_or_else(|| VmdkError::InvalidGeometry("seSparse capacity overflow".into()))?;
 
@@ -411,6 +420,7 @@ impl<R: Read + Seek> VmdkReader<R> {
                 grain_dir,
                 grain_size_bytes,
                 gt_offset_sectors: se_hdr.gt_offset,
+                grains_offset_sectors,
             },
             virtual_disk_size,
             disk_type: Box::from("seSparse"),
@@ -429,7 +439,7 @@ impl<R: Read + Seek> VmdkReader<R> {
     ///
     /// Called from `open()` when COWD magic is detected.
     fn open_cowd(mut reader: R, hdr_bytes: &[u8]) -> Result<Self, VmdkError> {
-        use cowd::{COWD_GTES_PER_GT, open_cowd};
+        use cowd::{open_cowd, COWD_GTES_PER_GT};
 
         // Reader is positioned after the 512-byte header; seek back to start so
         // open_cowd() can re-read the header for its own parsing.
@@ -476,36 +486,75 @@ impl<R: Read + Seek> VmdkReader<R> {
         let virtual_offset = lba * SECTOR_SIZE;
         match &self.fmt {
             FormatState::Flat => return Ok(true),
-            FormatState::Sparse { grain_dir, grain_size_bytes, num_gtes_per_gt, .. } => {
+            FormatState::Sparse {
+                grain_dir,
+                grain_size_bytes,
+                num_gtes_per_gt,
+                ..
+            } => {
                 let grain_idx = virtual_offset / grain_size_bytes;
                 let gd_idx = (grain_idx / num_gtes_per_gt) as usize;
                 let gte_idx = grain_idx % num_gtes_per_gt;
                 let gt_sector = grain_dir.get(gd_idx).copied().unwrap_or(0);
                 let _ = ();
-                if gt_sector == 0 { return Ok(false); }
+                if gt_sector == 0 {
+                    return Ok(false);
+                }
                 let gte_pos = u64::from(gt_sector) * SECTOR_SIZE + gte_idx * 4;
                 self.inner.seek(SeekFrom::Start(gte_pos))?;
                 let mut b = [0u8; 4];
                 self.inner.read_exact(&mut b)?;
                 return Ok(u32::from_le_bytes(b) > 1);
             }
-            FormatState::SeSparse { grain_dir, grain_size_bytes, gt_offset_sectors } => {
-                use sesparse::SE_GTES_PER_GT;
+            FormatState::SeSparse {
+                grain_dir,
+                grain_size_bytes,
+                gt_offset_sectors,
+                ..
+            } => {
+                let gd_entry = {
+                    let grain_idx = virtual_offset / grain_size_bytes;
+                    let gd_idx = (grain_idx / sesparse::SE_GTES_PER_GT) as usize;
+                    grain_dir.get(gd_idx).copied().unwrap_or(0)
+                };
                 let grain_idx = virtual_offset / grain_size_bytes;
-                let gd_idx = (grain_idx / SE_GTES_PER_GT) as usize;
-                let gte_idx = grain_idx % SE_GTES_PER_GT;
-                let gt_table_idx = grain_dir.get(gd_idx).copied().unwrap_or(0);
+                let gte_idx = grain_idx % sesparse::SE_GTES_PER_GT;
                 let gt_off = *gt_offset_sectors;
-                let _ = ();
-                if gt_table_idx == 0 { return Ok(false); }
-                let gt_sector = gt_off + (gt_table_idx - 1) * sesparse::SE_GT_SECTORS;
-                let gte_pos = gt_sector * SECTOR_SIZE + gte_idx * 8;
-                self.inner.seek(SeekFrom::Start(gte_pos))?;
-                let mut b = [0u8; 8];
-                self.inner.read_exact(&mut b)?;
-                return Ok(u64::from_le_bytes(b) != 0);
+                let Some(gte) = self.se_read_gte(gd_entry, gt_off, gte_idx)? else {
+                    return Ok(false);
+                };
+                // Allocated only when the GTE type nibble is "allocated" (0x3).
+                return Ok(gte & sesparse::SE_GTE_TYPE_MASK == sesparse::SE_GTE_TYPE_ALLOCATED);
             }
         }
+    }
+
+    /// Read a seSparse L2 (grain-table) entry given its L1 (GD) entry.
+    ///
+    /// Returns `Ok(None)` if the GD entry is unallocated, `Ok(Some(gte))` otherwise.
+    /// Validates the GD allocated-marker nibble per the seSparse encoding.
+    fn se_read_gte(
+        &mut self,
+        gd_entry: u64,
+        gt_offset_sectors: u64,
+        gte_idx: u64,
+    ) -> io::Result<Option<u64>> {
+        if gd_entry == 0 {
+            return Ok(None);
+        }
+        if gd_entry & sesparse::SE_GD_ALLOC_MASK != sesparse::SE_GD_ALLOC_FLAG {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "seSparse GD entry has invalid allocated marker",
+            ));
+        }
+        let gt_table_idx = gd_entry & sesparse::SE_GD_INDEX_MASK;
+        let gt_sector = gt_offset_sectors + gt_table_idx * sesparse::SE_GT_SECTORS;
+        let gte_pos = gt_sector * SECTOR_SIZE + gte_idx * 8;
+        self.inner.seek(SeekFrom::Start(gte_pos))?;
+        let mut b = [0u8; 8];
+        self.inner.read_exact(&mut b)?;
+        Ok(Some(u64::from_le_bytes(b)))
     }
 
     /// Iterate over all allocated (non-sparse) grain ranges in LBA order.
@@ -521,7 +570,10 @@ impl<R: Read + Seek> VmdkReader<R> {
                 return Ok(if sector_count == 0 {
                     vec![]
                 } else {
-                    vec![AllocatedGrain { start_lba: 0, sector_count }]
+                    vec![AllocatedGrain {
+                        start_lba: 0,
+                        sector_count,
+                    }]
                 });
             }
             FormatState::Sparse {
@@ -530,28 +582,46 @@ impl<R: Read + Seek> VmdkReader<R> {
                 num_gtes_per_gt,
                 ..
             } => (grain_dir.clone(), *grain_size_bytes, *num_gtes_per_gt),
-            FormatState::SeSparse { grain_dir, grain_size_bytes, gt_offset_sectors } => {
-                // For seSparse, iterate differently: GD entries are u64 table indices.
-                let (gd, gsz, goff) =
-                    (grain_dir.clone(), *grain_size_bytes, *gt_offset_sectors);
+            FormatState::SeSparse {
+                grain_dir,
+                grain_size_bytes,
+                gt_offset_sectors,
+                ..
+            } => {
+                let (gd, gsz, goff) = (grain_dir.clone(), *grain_size_bytes, *gt_offset_sectors);
                 let grain_sectors = gsz / SECTOR_SIZE;
+                let max_lba = self.virtual_disk_size / SECTOR_SIZE;
                 let mut result = Vec::new();
-                for (gd_idx, &gt_table_idx) in gd.iter().enumerate() {
-                    if gt_table_idx == 0 { continue; }
-                    let gt_sector = goff + (gt_table_idx - 1) * sesparse::SE_GT_SECTORS;
+                for (gd_idx, &gd_entry) in gd.iter().enumerate() {
+                    // Skip unallocated GD slots; require the allocated-marker nibble.
+                    if gd_entry == 0 {
+                        continue;
+                    }
+                    if gd_entry & sesparse::SE_GD_ALLOC_MASK != sesparse::SE_GD_ALLOC_FLAG {
+                        continue; // malformed GD entry — skip rather than abort the scan
+                    }
+                    let gt_table_idx = gd_entry & sesparse::SE_GD_INDEX_MASK;
+                    let gt_sector = goff + gt_table_idx * sesparse::SE_GT_SECTORS;
                     let gt_bytes_len = sesparse::SE_GTES_PER_GT as usize * 8;
                     self.inner.seek(SeekFrom::Start(gt_sector * SECTOR_SIZE))?;
                     let mut gt_bytes = vec![0u8; gt_bytes_len];
                     self.inner.read_exact(&mut gt_bytes)?;
                     for gte_idx in 0..sesparse::SE_GTES_PER_GT as usize {
                         let gte = u64::from_le_bytes(
-                            gt_bytes[gte_idx * 8..gte_idx * 8 + 8].try_into().expect("8 bytes")
+                            gt_bytes[gte_idx * 8..gte_idx * 8 + 8]
+                                .try_into()
+                                .expect("8 bytes"),
                         );
-                        if gte != 0 {
-                            let grain_idx = gd_idx as u64 * sesparse::SE_GTES_PER_GT + gte_idx as u64;
+                        // Only "allocated" (0x3) grains hold real data; zero/unmapped are sparse.
+                        if gte & sesparse::SE_GTE_TYPE_MASK == sesparse::SE_GTE_TYPE_ALLOCATED {
+                            let grain_idx =
+                                gd_idx as u64 * sesparse::SE_GTES_PER_GT + gte_idx as u64;
                             let start_lba = grain_idx * grain_sectors;
-                            if start_lba < self.virtual_disk_size / SECTOR_SIZE {
-                                result.push(AllocatedGrain { start_lba, sector_count: grain_sectors });
+                            if start_lba < max_lba {
+                                result.push(AllocatedGrain {
+                                    start_lba,
+                                    sector_count: grain_sectors,
+                                });
                             }
                         }
                     }
@@ -582,7 +652,10 @@ impl<R: Read + Seek> VmdkReader<R> {
                     let grain_idx = gd_idx as u64 * num_gtes_per_gt + gte_idx as u64;
                     let start_lba = grain_idx * grain_sectors;
                     if start_lba < self.virtual_disk_size / SECTOR_SIZE {
-                        result.push(AllocatedGrain { start_lba, sector_count: grain_sectors });
+                        result.push(AllocatedGrain {
+                            start_lba,
+                            sector_count: grain_sectors,
+                        });
                     }
                 }
             }
@@ -612,11 +685,13 @@ impl<R: Read + Seek> VmdkReader<R> {
         let sha_bytes = sha.finalize();
         let md_bytes = md.finalize();
         Ok(VmdkDigest {
-            sha256: sha_bytes.iter().fold(String::with_capacity(64), |mut s, b| {
-                use std::fmt::Write as _;
-                let _ = write!(s, "{b:02x}");
-                s
-            }),
+            sha256: sha_bytes
+                .iter()
+                .fold(String::with_capacity(64), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                }),
             md5: md_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
                 use std::fmt::Write as _;
                 let _ = write!(s, "{b:02x}");
@@ -635,27 +710,45 @@ impl<R: Read + Seek> VmdkReader<R> {
 
     /// Resolve `virtual_offset` to a [`GrainLookup`] describing where to find the data.
     fn grain_location(&mut self, virtual_offset: u64) -> io::Result<GrainLookup> {
-        // Dispatch seSparse separately: 8-byte GD entries + 8-byte GTEs.
-        if let FormatState::SeSparse { grain_dir, grain_size_bytes, gt_offset_sectors } = &self.fmt {
-            use sesparse::{SE_GTES_PER_GT, SE_GT_SECTORS};
+        // Dispatch seSparse separately: nibble-typed, bit-rotated 8-byte grain entries.
+        if let FormatState::SeSparse {
+            grain_dir,
+            grain_size_bytes,
+            gt_offset_sectors,
+            grains_offset_sectors,
+        } = &self.fmt
+        {
+            let grain_size_bytes = *grain_size_bytes;
+            let grain_sectors = grain_size_bytes / SECTOR_SIZE;
+            let grains_offset = *grains_offset_sectors;
+            let gt_off = *gt_offset_sectors;
             let grain_idx = virtual_offset / grain_size_bytes;
             let offset_in_grain = virtual_offset % grain_size_bytes;
-            let gd_idx = (grain_idx / SE_GTES_PER_GT) as usize;
-            let gte_idx = grain_idx % SE_GTES_PER_GT;
-            let gt_table_idx = grain_dir.get(gd_idx).copied().unwrap_or(0);
-            let gt_off = *gt_offset_sectors;
-            let _ = (); // end immutable borrow
-            if gt_table_idx == 0 { return Ok(GrainLookup::Sparse); }
-            let gt_sector = gt_off + (gt_table_idx - 1) * SE_GT_SECTORS;
-            let gte_pos = gt_sector * SECTOR_SIZE + gte_idx * 8;
-            self.inner.seek(SeekFrom::Start(gte_pos))?;
-            let mut b = [0u8; 8];
-            self.inner.read_exact(&mut b)?;
-            let gte = u64::from_le_bytes(b);
-            return if gte == 0 {
-                Ok(GrainLookup::Sparse)
-            } else {
-                Ok(GrainLookup::FileOffset(gte * SECTOR_SIZE + offset_in_grain))
+            let gd_idx = (grain_idx / sesparse::SE_GTES_PER_GT) as usize;
+            let gte_idx = grain_idx % sesparse::SE_GTES_PER_GT;
+            let gd_entry = grain_dir.get(gd_idx).copied().unwrap_or(0);
+
+            let Some(gte) = self.se_read_gte(gd_entry, gt_off, gte_idx)? else {
+                return Ok(GrainLookup::Sparse);
+            };
+            return match gte & sesparse::SE_GTE_TYPE_MASK {
+                // Unallocated: the whole entry must be zero (already handled by se_read_gte
+                // for the GD level; a zero GTE here means a sparse grain within an allocated GT).
+                0 if gte == 0 => Ok(GrainLookup::Sparse),
+                sesparse::SE_GTE_TYPE_UNMAPPED | sesparse::SE_GTE_TYPE_ZERO => {
+                    Ok(GrainLookup::Sparse)
+                }
+                sesparse::SE_GTE_TYPE_ALLOCATED => {
+                    let grain_index = sesparse::se_gte_grain_index(gte);
+                    let cluster_sector = grains_offset + grain_index * grain_sectors;
+                    Ok(GrainLookup::FileOffset(
+                        cluster_sector * SECTOR_SIZE + offset_in_grain,
+                    ))
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "seSparse grain entry has unsupported type nibble",
+                )),
             };
         }
 
@@ -674,7 +767,13 @@ impl<R: Read + Seek> VmdkReader<R> {
             let gd_idx = (grain_idx / num_gtes_per_gt) as usize;
             let gte_idx = grain_idx % num_gtes_per_gt;
             let gt_sector = grain_dir.get(gd_idx).copied().unwrap_or(0);
-            (gt_sector, gte_idx, offset_in_grain, *compressed, *grain_size_bytes)
+            (
+                gt_sector,
+                gte_idx,
+                offset_in_grain,
+                *compressed,
+                *grain_size_bytes,
+            )
         };
         if gt_sector == 0 {
             return Ok(GrainLookup::Sparse);
@@ -687,7 +786,12 @@ impl<R: Read + Seek> VmdkReader<R> {
             let gt_byte_offset = u64::from(gt_sector) * SECTOR_SIZE;
             self.inner.seek(SeekFrom::Start(gt_byte_offset))?;
             let gt_size = {
-                let FormatState::Sparse { num_gtes_per_gt, .. } = &self.fmt else { unreachable!() };
+                let FormatState::Sparse {
+                    num_gtes_per_gt, ..
+                } = &self.fmt
+                else {
+                    unreachable!()
+                };
                 *num_gtes_per_gt as usize * 4
             };
             let mut gt_bytes = vec![0u8; gt_size];
@@ -786,8 +890,12 @@ impl VmdkFileReader {
 
             match desc.create_type.as_ref() {
                 // ESXi flat formats (preallocated): FLAT/VMFS extent type — raw bytes.
-                "vmfs" | "vmfsPreallocated" | "vmfsEagerZeroedThick" | "vmfsRDM"
-                | "twoGbMaxExtentFlat" | "monolithicFlat" => {
+                "vmfs"
+                | "vmfsPreallocated"
+                | "vmfsEagerZeroedThick"
+                | "vmfsRDM"
+                | "twoGbMaxExtentFlat"
+                | "monolithicFlat" => {
                     let multi = MultiExtentReader::open(dir, &desc.extents)?;
                     let virtual_disk_size = desc
                         .capacity_sectors
@@ -804,8 +912,8 @@ impl VmdkFileReader {
                         parent_cid: desc.parent_cid,
                         descriptor_text: desc.raw_text,
                         rgd_offset: 0,
-            gd_entry_count: 0,
-            gt_cache: HashMap::new(),
+                        gd_entry_count: 0,
+                        gt_cache: HashMap::new(),
                     })
                 }
                 // ESXi sparse formats: SPARSE/VMFSSPARSE extent type — binary VMDK4 or COWD.
@@ -814,7 +922,9 @@ impl VmdkFileReader {
                     let virtual_disk_size = desc
                         .sparse_capacity_sectors
                         .checked_mul(SECTOR_SIZE)
-                        .ok_or_else(|| VmdkError::InvalidGeometry("capacity overflow".into()))?;
+                        .ok_or_else(|| {
+                        VmdkError::InvalidGeometry("capacity overflow".into())
+                    })?;
                     Ok(VmdkReader {
                         inner: Box::new(multi) as Box<dyn ReadSeek + Send>,
                         fmt: FormatState::Flat,
@@ -826,9 +936,20 @@ impl VmdkFileReader {
                         parent_cid: desc.parent_cid,
                         descriptor_text: desc.raw_text,
                         rgd_offset: 0,
-            gd_entry_count: 0,
-            gt_cache: HashMap::new(),
+                        gd_entry_count: 0,
+                        gt_cache: HashMap::new(),
                     })
+                }
+                // seSparse: a single binary extent whose CAFEBABE magic selects the reader.
+                "seSparse" => {
+                    let entry = desc.sparse_extents.first().ok_or_else(|| {
+                        VmdkError::InvalidGeometry(
+                            "seSparse descriptor has no SESPARSE extent".into(),
+                        )
+                    })?;
+                    let extent_path = dir.join(entry.filename.as_ref());
+                    let file = BufReader::new(File::open(&extent_path)?);
+                    Ok(VmdkReader::open(file)?.into_file_reader())
                 }
                 _ => Err(VmdkError::UnsupportedDiskType(
                     desc.create_type.into_string(),
@@ -881,8 +1002,12 @@ impl<R: Read + Seek> Read for VmdkReader<R> {
 
         // Sparse / StreamOptimized / SeSparse: clamp at grain boundary then do GTE lookup.
         let grain_size_bytes = match &self.fmt {
-            FormatState::Sparse { grain_size_bytes, .. } => *grain_size_bytes,
-            FormatState::SeSparse { grain_size_bytes, .. } => *grain_size_bytes,
+            FormatState::Sparse {
+                grain_size_bytes, ..
+            } => *grain_size_bytes,
+            FormatState::SeSparse {
+                grain_size_bytes, ..
+            } => *grain_size_bytes,
             FormatState::Flat => unreachable!(),
         };
         let remaining_in_grain = (grain_size_bytes - (self.pos % grain_size_bytes)) as usize;
@@ -902,7 +1027,12 @@ impl<R: Read + Seek> Read for VmdkReader<R> {
                 data_offset,
                 data_size,
                 offset_in_grain,
-            } => self.read_compressed_grain(&mut buf[..to_read], data_offset, data_size, offset_in_grain)?,
+            } => self.read_compressed_grain(
+                &mut buf[..to_read],
+                data_offset,
+                data_size,
+                offset_in_grain,
+            )?,
         };
 
         self.pos += n as u64;
@@ -1029,8 +1159,7 @@ mod tests {
     #[test]
     fn stream_opt_gd_at_end_reads_zeros() {
         let vmdk = gd_at_end_stream_opt_vmdk();
-        let mut reader =
-            VmdkReader::open(Cursor::new(vmdk)).expect("open GD_AT_END vmdk");
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open GD_AT_END vmdk");
         let mut buf = [0xFFu8; 512];
         reader.read_exact(&mut buf).expect("read sector 0");
         assert_eq!(buf, [0u8; 512]);
@@ -1100,7 +1229,11 @@ mod tests {
         let desc_path = dir.path().join("disk_desc.vmdk");
         std::fs::write(&desc_path, desc.as_bytes()).unwrap();
         let result = VmdkFileReader::open_path(&desc_path);
-        assert!(result.is_ok(), "vmfs descriptor with VMFS extent must open, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "vmfs descriptor with VMFS extent must open, got: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1110,7 +1243,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cowd_bytes = testutil::test_cowd_vmdk(&[0u8; 512]);
         let cowd_path = dir.path().join("disk-delta.vmdk");
-        std::fs::File::create(&cowd_path).unwrap().write_all(&cowd_bytes).unwrap();
+        std::fs::File::create(&cowd_path)
+            .unwrap()
+            .write_all(&cowd_bytes)
+            .unwrap();
         let desc = format!(
             "# Disk DescriptorFile\nversion=1\nCID=ffffffff\nparentCID=ffffffff\ncreateType=\"vmfsSparse\"\nRW 8 VMFSSPARSE \"{}\"\n",
             cowd_path.file_name().unwrap().to_string_lossy()
@@ -1118,7 +1254,11 @@ mod tests {
         let desc_path = dir.path().join("desc.vmdk");
         std::fs::write(&desc_path, desc.as_bytes()).unwrap();
         let result = VmdkFileReader::open_path(&desc_path);
-        assert!(result.is_ok(), "vmfsSparse/VMFSSPARSE descriptor must open, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "vmfsSparse/VMFSSPARSE descriptor must open, got: {:?}",
+            result.err()
+        );
     }
 
     // ── seSparse format (vSphere 6.5+ VMFS6) ─────────────────────────────────
@@ -1127,7 +1267,11 @@ mod tests {
     fn sesparse_vmdk_opens_successfully() {
         let se = test_sesparse_vmdk(&[0u8; 512]);
         let reader = VmdkReader::open(Cursor::new(se));
-        assert!(reader.is_ok(), "seSparse VMDK must open, got: {:?}", reader.err());
+        assert!(
+            reader.is_ok(),
+            "seSparse VMDK must open, got: {:?}",
+            reader.err()
+        );
     }
 
     #[test]
@@ -1150,13 +1294,50 @@ mod tests {
         assert_eq!(buf[1], 0xA5);
     }
 
+    #[test]
+    fn sesparse_extent_descriptor_opens_via_open_path() {
+        // seSparse descriptor (createType="seSparse", SESPARSE extent) must route
+        // through open_path to the binary extent. This path was a gap until qemu-img
+        // cross-validation exposed it (the bare-binary magic path worked, the
+        // descriptor path did not).
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut data = vec![0u8; 512];
+        data[0] = 0x7E;
+        let se_bytes = test_sesparse_vmdk(&data);
+        let se_path = dir.path().join("disk-sesparse.vmdk");
+        std::fs::File::create(&se_path)
+            .unwrap()
+            .write_all(&se_bytes)
+            .unwrap();
+        let desc = format!(
+            "# Disk DescriptorFile\nversion=1\nCID=abcdef01\nparentCID=ffffffff\ncreateType=\"seSparse\"\nRW 8 SESPARSE \"{}\"\n",
+            se_path.file_name().unwrap().to_string_lossy()
+        );
+        let desc_path = dir.path().join("disk.vmdk");
+        std::fs::write(&desc_path, desc.as_bytes()).unwrap();
+        let mut reader = VmdkFileReader::open_path(&desc_path)
+            .expect("seSparse descriptor must open via open_path");
+        assert_eq!(reader.disk_type(), "seSparse");
+        let mut buf = [0u8; 1];
+        reader.read_exact(&mut buf).expect("read grain 0");
+        assert_eq!(
+            buf[0], 0x7E,
+            "must read seSparse grain data through the descriptor"
+        );
+    }
+
     // ── COWD format (vmfsSparse / vmfsThin) ──────────────────────────────────
 
     #[test]
     fn cowd_vmdk_opens_without_bad_magic_error() {
         let cowd = test_cowd_vmdk(&[0u8; 512]);
         let reader = VmdkReader::open(Cursor::new(cowd));
-        assert!(reader.is_ok(), "COWD VMDK must open successfully, got: {:?}", reader.err());
+        assert!(
+            reader.is_ok(),
+            "COWD VMDK must open successfully, got: {:?}",
+            reader.err()
+        );
     }
 
     #[test]
@@ -1193,13 +1374,11 @@ mod tests {
         // SHA-256 of 1 MiB (1_048_576) zero bytes (computed independently):
         // echo -n | dd bs=1 count=0 | ... — computed via sha256sum
         assert_eq!(
-            digest.sha256,
-            "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58",
+            digest.sha256, "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58",
             "SHA-256 of 1 MiB all-zeros"
         );
         assert_eq!(
-            digest.md5,
-            "b6d81b360a5672d80c27430f39153e2c",
+            digest.md5, "b6d81b360a5672d80c27430f39153e2c",
             "MD5 of 1 MiB all-zeros (matches qemu-img reference)"
         );
     }
@@ -1223,8 +1402,14 @@ mod tests {
         let reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
         let info = reader.info();
         let json = serde_json::to_string(&info).expect("serialize VmdkInfo to JSON");
-        assert!(json.contains("\"disk_type\""), "JSON must contain disk_type field");
-        assert!(json.contains("monolithicSparse"), "JSON must contain createType value");
+        assert!(
+            json.contains("\"disk_type\""),
+            "JSON must contain disk_type field"
+        );
+        assert!(
+            json.contains("monolithicSparse"),
+            "JSON must contain createType value"
+        );
         let info2: VmdkInfo = serde_json::from_str(&json).expect("deserialize VmdkInfo from JSON");
         assert_eq!(info2.disk_type, info.disk_type);
         assert_eq!(info2.virtual_disk_size, info.virtual_disk_size);
@@ -1233,7 +1418,10 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn allocated_grain_serializes_to_json() {
-        let grain = AllocatedGrain { start_lba: 128, sector_count: 8 };
+        let grain = AllocatedGrain {
+            start_lba: 128,
+            sector_count: 8,
+        };
         let json = serde_json::to_string(&grain).expect("serialize AllocatedGrain");
         assert!(json.contains("\"start_lba\""));
         assert!(json.contains("128"));
@@ -1250,7 +1438,11 @@ mod tests {
         assert_eq!(reader.gt_cache_size(), 0, "cache starts empty");
         let mut buf = [0u8; 512];
         reader.read_exact(&mut buf).expect("read");
-        assert_eq!(reader.gt_cache_size(), 1, "one GT loaded after first grain read");
+        assert_eq!(
+            reader.gt_cache_size(),
+            1,
+            "one GT loaded after first grain read"
+        );
     }
 
     #[test]
@@ -1286,7 +1478,9 @@ mod tests {
         // Grain 1 and beyond: GTE == 0 (sparse).
         let grain_sectors = GRAIN_SIZE_BYTES as u64 / 512;
         assert!(
-            !reader.is_allocated(grain_sectors).expect("is_allocated lba=grain_sectors"),
+            !reader
+                .is_allocated(grain_sectors)
+                .expect("is_allocated lba=grain_sectors"),
             "grain 1 must be sparse"
         );
     }
@@ -1297,7 +1491,9 @@ mod tests {
         let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
         let beyond = reader.sector_count() + 1;
         assert!(
-            !reader.is_allocated(beyond).expect("is_allocated beyond end"),
+            !reader
+                .is_allocated(beyond)
+                .expect("is_allocated beyond end"),
             "LBA beyond virtual disk must be not-allocated"
         );
     }
@@ -1306,7 +1502,9 @@ mod tests {
     fn iter_allocated_grains_yields_grain_zero() {
         let vmdk = test_sparse_vmdk(&[0u8; 512]);
         let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let grains = reader.iter_allocated_grains().expect("iter_allocated_grains");
+        let grains = reader
+            .iter_allocated_grains()
+            .expect("iter_allocated_grains");
         assert_eq!(grains.len(), 1, "only grain 0 is allocated");
         assert_eq!(grains[0].start_lba, 0);
         assert_eq!(grains[0].sector_count, GRAIN_SIZE_BYTES as u64 / 512);
@@ -1316,8 +1514,13 @@ mod tests {
     fn iter_allocated_grains_all_sparse_returns_empty() {
         let vmdk = gd_at_end_stream_opt_vmdk(); // all-sparse streamOptimized
         let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let grains = reader.iter_allocated_grains().expect("iter_allocated_grains");
-        assert!(grains.is_empty(), "all-sparse VMDK must yield no allocated grains");
+        let grains = reader
+            .iter_allocated_grains()
+            .expect("iter_allocated_grains");
+        assert!(
+            grains.is_empty(),
+            "all-sparse VMDK must yield no allocated grains"
+        );
     }
 
     // ── VmdkInfo / metadata API ───────────────────────────────────────────────
@@ -1363,7 +1566,10 @@ mod tests {
         let reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
         let info = reader.info();
         assert_eq!(info.grain_size_bytes, info.grain_size_sectors * 512);
-        assert!(info.grain_size_sectors >= 8, "grain_size_sectors must meet VDF 1.1 minimum");
+        assert!(
+            info.grain_size_sectors >= 8,
+            "grain_size_sectors must meet VDF 1.1 minimum"
+        );
     }
 
     #[test]
@@ -1372,7 +1578,10 @@ mod tests {
         let vmdk = test_sparse_vmdk(&[0u8; 512]);
         let reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
         let info = reader.info();
-        assert_eq!(info.cid, 0xffff_fffe, "CID must be parsed from embedded descriptor");
+        assert_eq!(
+            info.cid, 0xffff_fffe,
+            "CID must be parsed from embedded descriptor"
+        );
         assert_eq!(
             info.parent_cid, 0xffff_ffff,
             "parentCID must be 0xffffffff (no parent) for a base image"
@@ -1396,7 +1605,9 @@ mod tests {
         let mut reader = VmdkReader::open(Cursor::new(vmdk))
             .expect("VMDK with oversized marker must open — error only on read");
         let mut buf = [0u8; 512];
-        let err = reader.read(&mut buf).expect_err("oversized data_size must return Err");
+        let err = reader
+            .read(&mut buf)
+            .expect_err("oversized data_size must return Err");
         assert_eq!(
             err.kind(),
             io::ErrorKind::InvalidData,

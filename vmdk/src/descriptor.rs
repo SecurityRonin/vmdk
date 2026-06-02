@@ -81,7 +81,9 @@ pub(crate) fn parse_text_descriptor(text: &str) -> Result<TextDescriptor> {
         if let Some(ext) = try_parse_sparse_extent(line) {
             sparse_capacity_sectors = sparse_capacity_sectors
                 .checked_add(ext.size_sectors)
-                .ok_or_else(|| VmdkError::InvalidGeometry("sparse extent capacity overflow".into()))?;
+                .ok_or_else(|| {
+                    VmdkError::InvalidGeometry("sparse extent capacity overflow".into())
+                })?;
             sparse_extents.push(ext);
         }
     }
@@ -158,8 +160,10 @@ fn try_parse_sparse_extent(line: &str) -> Option<SparseEntry> {
     rest = tail;
 
     let (ext_type, tail) = split_token(rest)?;
-    // SPARSE is standard VMDK4 sparse; VMFSSPARSE is COWD-based ESXi sparse.
-    if !matches!(ext_type, "SPARSE" | "VMFSSPARSE") {
+    // SPARSE = standard VMDK4 sparse; VMFSSPARSE = COWD-based ESXi sparse;
+    // SESPARSE = vSphere 6.5+ space-efficient sparse. All resolve to a binary
+    // extent whose own magic selects the reader.
+    if !matches!(ext_type, "SPARSE" | "VMFSSPARSE" | "SESPARSE") {
         return None;
     }
     rest = tail.trim_start();

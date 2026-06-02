@@ -113,7 +113,10 @@ fn cmd_info(path: &std::path::Path, descriptor: bool, chain: bool) {
         .unwrap_or_default();
 
     println!("File:              {file_name}");
-    println!("Format:            VMDK v{} ({})", info.version, info.disk_type);
+    println!(
+        "Format:            VMDK v{} ({})",
+        info.version, info.disk_type
+    );
     println!(
         "Virtual disk size: {} bytes ({mib:.2} MiB)",
         fmt_commas(info.virtual_disk_size)
@@ -127,7 +130,10 @@ fn cmd_info(path: &std::path::Path, descriptor: bool, chain: bool) {
             info.grain_size_bytes / 1024
         );
     }
-    println!("Compressed:        {}", if info.compressed { "yes" } else { "no" });
+    println!(
+        "Compressed:        {}",
+        if info.compressed { "yes" } else { "no" }
+    );
     if info.cid != 0xffff_ffff {
         println!("CID:               {:08x}", info.cid);
     }
@@ -154,7 +160,10 @@ fn print_chain(path: &std::path::Path) {
     match VmdkChainReader::open(path) {
         Ok(chain) => {
             println!("Chain depth:  {} layer(s)", chain.depth());
-            println!("Virtual size: {} bytes", fmt_commas(chain.virtual_disk_size()));
+            println!(
+                "Virtual size: {} bytes",
+                fmt_commas(chain.virtual_disk_size())
+            );
         }
         Err(e) => {
             // Fall back to single-image view, reporting parentCID if present.
@@ -164,7 +173,10 @@ fn print_chain(path: &std::path::Path) {
                     println!("Chain depth:  1 layer");
                     println!("Virtual size: {} bytes", fmt_commas(info.virtual_disk_size));
                     if info.parent_cid != 0xffff_ffff {
-                        println!("Parent CID:   {:08x} (parent file not found: {e})", info.parent_cid);
+                        println!(
+                            "Parent CID:   {:08x} (parent file not found: {e})",
+                            info.parent_cid
+                        );
                     } else {
                         println!("No parent (base image)");
                     }
@@ -230,7 +242,11 @@ fn cmd_dump(
         let mut w = BufWriter::new(file);
         copy_n(&mut reader, &mut w, to_output);
         w.flush().ok();
-        eprintln!("Wrote {} bytes to {}", fmt_commas(to_output), out_path.display());
+        eprintln!(
+            "Wrote {} bytes to {}",
+            fmt_commas(to_output),
+            out_path.display()
+        );
     } else {
         let stdout = io::stdout();
         let mut w = BufWriter::new(stdout.lock());
@@ -288,7 +304,11 @@ fn dump_hex<R: Read>(reader: &mut R, start_offset: u64, length: u64) {
         }
         let _ = write!(w, " |");
         for &c in &buf[..n] {
-            let ch = if c.is_ascii_graphic() || c == b' ' { c as char } else { '.' };
+            let ch = if c.is_ascii_graphic() || c == b' ' {
+                c as char
+            } else {
+                '.'
+            };
             let _ = write!(w, "{ch}");
         }
         let _ = writeln!(w, "|");
@@ -394,9 +414,19 @@ fn cmd_diff(a: &std::path::Path, b: &std::path::Path) {
 fn main() {
     let cli = Cli::parse();
     match &cli.command {
-        Command::Info { path, descriptor, chain } => cmd_info(path, *descriptor, *chain),
+        Command::Info {
+            path,
+            descriptor,
+            chain,
+        } => cmd_info(path, *descriptor, *chain),
         Command::Map { path } => cmd_map(path),
-        Command::Dump { path, output, offset, length, hex } => {
+        Command::Dump {
+            path,
+            output,
+            offset,
+            length,
+            hex,
+        } => {
             cmd_dump(path, output.as_deref(), *offset, *length, *hex);
         }
         Command::Hash { path } => cmd_hash(path),
