@@ -15,6 +15,8 @@ fn data_path(name: &str) -> String {
         .into_owned()
 }
 
+// ── info ──────────────────────────────────────────────────────────────────────
+
 #[test]
 fn info_shows_virtual_disk_size_minimal() {
     let out = vmdk_bin()
@@ -77,10 +79,7 @@ fn info_errors_on_missing_file() {
         .args(["info", "nonexistent.vmdk"])
         .output()
         .expect("vmdk binary must run");
-    assert!(
-        !out.status.success(),
-        "should exit non-zero for missing file"
-    );
+    assert!(!out.status.success(), "should exit non-zero for missing file");
 }
 
 #[test]
@@ -89,11 +88,7 @@ fn info_shows_stream_optimized_disk_type() {
         .args(["info", &data_path("stream_opt.vmdk")])
         .output()
         .expect("vmdk binary must run");
-    assert!(
-        out.status.success(),
-        "stream_opt.vmdk info must succeed after v3 support, exit: {}",
-        out.status
-    );
+    assert!(out.status.success(), "exit: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("streamOptimized"),
@@ -107,11 +102,7 @@ fn info_shows_flat_vmdk_disk_type() {
         .args(["info", &data_path("flat.vmdk")])
         .output()
         .expect("vmdk binary must run");
-    assert!(
-        out.status.success(),
-        "flat.vmdk info must succeed after open_path support, exit: {}",
-        out.status
-    );
+    assert!(out.status.success(), "exit: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("twoGbMaxExtentFlat"),
@@ -119,17 +110,48 @@ fn info_shows_flat_vmdk_disk_type() {
     );
 }
 
-// ── sectors command ───────────────────────────────────────────────────────────
+// ── info --descriptor (folds in old `descriptor` command) ─────────────────────
 
 #[test]
-fn sectors_all_sparse_shows_no_allocated() {
+fn info_descriptor_flag_shows_create_type() {
     let out = vmdk_bin()
-        .args(["sectors", &data_path("minimal.vmdk")])
+        .args(["info", "--descriptor", &data_path("minimal.vmdk")])
         .output()
-        .expect("vmdk sectors must run");
+        .expect("vmdk info --descriptor must run");
     assert!(out.status.success(), "exit: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // minimal.vmdk is all-sparse; sectors header should appear
+    assert!(
+        stdout.contains("createType") || stdout.contains("monolithicSparse"),
+        "expected raw descriptor text, got: {stdout}"
+    );
+}
+
+// ── info --chain (folds in old `snapshot-chain` command) ──────────────────────
+
+#[test]
+fn info_chain_flag_base_image_shows_depth_one() {
+    let out = vmdk_bin()
+        .args(["info", "--chain", &data_path("minimal.vmdk")])
+        .output()
+        .expect("vmdk info --chain must run");
+    assert!(out.status.success(), "exit: {}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 layer") || stdout.contains("depth: 1"),
+        "expected chain depth 1, got: {stdout}"
+    );
+}
+
+// ── map (renamed from `sectors`) ──────────────────────────────────────────────
+
+#[test]
+fn map_all_sparse_shows_no_allocated() {
+    let out = vmdk_bin()
+        .args(["map", &data_path("minimal.vmdk")])
+        .output()
+        .expect("vmdk map must run");
+    assert!(out.status.success(), "exit: {}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("start_lba") || stdout.contains("No allocated") || stdout.contains("sparse"),
         "got: {stdout}"
@@ -137,51 +159,87 @@ fn sectors_all_sparse_shows_no_allocated() {
 }
 
 #[test]
-fn sectors_dfvfs_shows_allocated_grains() {
+fn map_dfvfs_shows_allocated_grains() {
     let out = vmdk_bin()
-        .args(["sectors", &data_path("dfvfs_ext2.vmdk")])
+        .args(["map", &data_path("dfvfs_ext2.vmdk")])
         .output()
-        .expect("vmdk sectors must run");
+        .expect("vmdk map must run");
     assert!(out.status.success(), "exit: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // dfvfs_ext2 has allocated grains — check for numeric output
     assert!(
         stdout.contains(',') || stdout.contains("allocated grain"),
         "expected allocated grain ranges, got: {stdout}"
     );
 }
 
-// ── descriptor command ────────────────────────────────────────────────────────
+// ── dump (folds in cat + extract + hexdump) ───────────────────────────────────
 
 #[test]
-fn descriptor_shows_create_type() {
+fn dump_to_stdout_outputs_disk_bytes() {
+    // Default dump (no -o, no --hex) writes raw bytes to stdout (was: cat).
     let out = vmdk_bin()
-        .args(["descriptor", &data_path("minimal.vmdk")])
+        .args(["dump", &data_path("minimal.vmdk")])
         .output()
-        .expect("vmdk descriptor must run");
+        .expect("vmdk dump must run");
     assert!(out.status.success(), "exit: {}", out.status);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("createType") || stdout.contains("monolithicSparse"),
-        "expected descriptor text, got: {stdout}"
-    );
+    // minimal.vmdk is 1 MiB all-zeros → stdout should be 1,048,576 zero bytes
+    assert_eq!(out.stdout.len(), 1_048_576, "dump must emit full virtual disk to stdout");
+    assert!(out.stdout.iter().all(|&b| b == 0), "all-sparse disk must dump as zeros");
 }
-
-// ── hexdump command ───────────────────────────────────────────────────────────
 
 #[test]
-fn hexdump_outputs_hex_bytes() {
+fn dump_hex_flag_outputs_hex() {
     let out = vmdk_bin()
-        .args(["hexdump", &data_path("dfvfs_ext2.vmdk"), "0", "32"])
+        .args(["dump", "--hex", "--offset", "0", "--length", "32", &data_path("dfvfs_ext2.vmdk")])
         .output()
-        .expect("vmdk hexdump must run");
+        .expect("vmdk dump --hex must run");
     assert!(out.status.success(), "exit: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Output must contain hex digits and offset
-    assert!(stdout.contains("00000000"), "expected hex offset, got: {stdout}");
+    assert!(stdout.contains("00000000"), "expected hex offset column, got: {stdout}");
 }
 
-// ── hash command ──────────────────────────────────────────────────────────────
+#[test]
+fn dump_output_file_produces_raw_of_correct_size() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out_path = tmp.path().join("out.raw");
+    let status = vmdk_bin()
+        .args([
+            "dump",
+            "-o",
+            out_path.to_str().unwrap(),
+            &data_path("minimal.vmdk"),
+        ])
+        .status()
+        .expect("vmdk dump -o must run");
+    assert!(status.success(), "exit: {status}");
+    let meta = std::fs::metadata(&out_path).expect("output file must exist");
+    assert_eq!(meta.len(), 1_048_576, "raw file must be 1 MiB");
+}
+
+#[test]
+fn dump_offset_length_reads_subrange() {
+    // Dump 16 bytes at offset 1024 of dfvfs_ext2 (has real data there) to a file.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out_path = tmp.path().join("range.raw");
+    let status = vmdk_bin()
+        .args([
+            "dump",
+            "--offset",
+            "1024",
+            "--length",
+            "16",
+            "-o",
+            out_path.to_str().unwrap(),
+            &data_path("dfvfs_ext2.vmdk"),
+        ])
+        .status()
+        .expect("vmdk dump range must run");
+    assert!(status.success(), "exit: {status}");
+    let meta = std::fs::metadata(&out_path).expect("output file");
+    assert_eq!(meta.len(), 16, "range dump must be exactly 16 bytes");
+}
+
+// ── hash ──────────────────────────────────────────────────────────────────────
 
 #[test]
 fn hash_produces_sha256_and_md5() {
@@ -203,14 +261,13 @@ fn hash_minimal_vmdk_matches_known_md5() {
         .expect("vmdk hash must run");
     assert!(out.status.success(), "exit: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Known MD5 from docs/validation.md
     assert!(
         stdout.contains("b6d81b360a5672d80c27430f39153e2c"),
         "MD5 mismatch, got: {stdout}"
     );
 }
 
-// ── verify command ────────────────────────────────────────────────────────────
+// ── verify ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn verify_minimal_vmdk_exits_ok() {
@@ -223,7 +280,7 @@ fn verify_minimal_vmdk_exits_ok() {
     assert!(stdout.contains("OK"), "expected OK in verify output, got: {stdout}");
 }
 
-// ── diff command ──────────────────────────────────────────────────────────────
+// ── diff ──────────────────────────────────────────────────────────────────────
 
 #[test]
 fn diff_identical_vmdk_reports_identical() {
@@ -251,40 +308,4 @@ fn diff_different_vmdks_exits_nonzero() {
         !out.status.success(),
         "diff of different VMDKs (different sizes) must exit non-zero"
     );
-}
-
-// ── snapshot-chain command ────────────────────────────────────────────────────
-
-#[test]
-fn snapshot_chain_base_image_shows_depth_one() {
-    let out = vmdk_bin()
-        .args(["snapshot-chain", &data_path("minimal.vmdk")])
-        .output()
-        .expect("vmdk snapshot-chain must run");
-    assert!(out.status.success(), "exit: {}", out.status);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("1 layer") || stdout.contains("depth: 1"),
-        "expected depth 1, got: {stdout}"
-    );
-}
-
-// ── extract command ───────────────────────────────────────────────────────────
-
-#[test]
-fn extract_produces_raw_file_of_correct_size() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let out_path = tmp.path().join("out.raw");
-    let status = vmdk_bin()
-        .args([
-            "extract",
-            &data_path("minimal.vmdk"),
-            "--output",
-            out_path.to_str().unwrap(),
-        ])
-        .status()
-        .expect("vmdk extract must run");
-    assert!(status.success(), "exit: {status}");
-    let meta = std::fs::metadata(&out_path).expect("output file must exist");
-    assert_eq!(meta.len(), 1_048_576, "raw file must be 1 MiB");
 }
