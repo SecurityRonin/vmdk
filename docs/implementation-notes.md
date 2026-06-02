@@ -219,20 +219,39 @@ subformat=streamOptimized`) have an **identical GD/GT layout to v1** (gd_offset=
 all GTEs=0). No DEFLATE decompression is needed — all grains are unmapped and
 return zeros identically to a monolithicSparse empty disk.
 
-Compressed streamOptimized disks (with actual grain data) are rejected at read time:
+### 8a. Compressed grain layout: GrainMarker
 
-```rust
-if compressed {
-    return Err(io::Error::new(io::ErrorKind::Unsupported,
-        "allocated compressed grains (streamOptimized) are not yet supported"));
-}
+Allocated grains in streamOptimized VMDKs are preceded by a 12-byte `GrainMarker`
+header inline in the data stream (VDF 1.1 §4.5):
+
 ```
+[0..8]   lba      u64  logical block address (informational)
+[8..12]  size     u32  compressed byte length that follows
+[12..]   data     u8[] compressed grain payload (size bytes)
+```
+
+The GTE value (≥ 2) points to the **sector** containing the `GrainMarker`; the
+compressed payload begins at `gte * 512 + 12`.
+
+### 8b. RFC 1950 vs RFC 1951 — spec documentation error
+
+**Spec (VDF 1.1 §4.4):** states the grain payload uses "RFC 1951" (raw DEFLATE).
+
+**Reality:** both VMware tooling and QEMU write **RFC 1950** (zlib-wrapped) payloads —
+a 2-byte `78 9c` zlib header, followed by the DEFLATE stream, followed by a 4-byte
+Adler-32 trailer.
+
+Use `flate2::read::ZlibDecoder`, **not** `DeflateDecoder`. Using `DeflateDecoder` will
+fail with a decompression error on any real-world file because it chokes on the two
+leading zlib header bytes.
+
+Empirically confirmed on QEMU-generated compressed corpus files.
 
 ---
 
 ## 9. Text descriptors: `createType` and extent parsing
 
-### Text descriptor format (twoGbMaxExtentFlat, twoGbMaxExtentSparse, monolithicFlat)
+### Text descriptor format
 
 Some VMDKs are text-only descriptor files (first byte `#`):
 
@@ -249,12 +268,8 @@ RW <sectors> SPARSE "<filename>"
 ```
 
 `open_path()` detects the `#` first byte and routes to `parse_text_descriptor()` in
-`descriptor.rs`. Only `FLAT` extents are collected; `SPARSE` extents are ignored
-(collected into `ExtentEntry` and excluded from `extents`).
-
-**Reject-if-empty guard:** after parsing, if `extents` is empty but `create_type` is
-non-empty, `open_path()` returns `Err(UnsupportedDiskType(create_type))` rather than
-silently building a zero-byte virtual disk.
+`descriptor.rs`. `FLAT` extents are collected into `extents`; `SPARSE` extents are
+collected separately into `sparse_extents` for `twoGbMaxExtentSparse` handling.
 
 ### Embedded text descriptor (monolithicSparse, streamOptimized)
 
@@ -271,10 +286,10 @@ for sparse VMDKs.
 | Value | Meaning | Support |
 |-------|---------|---------|
 | `monolithicSparse` | Single-file binary sparse | `open()` + `open_path()` |
-| `streamOptimized` | Binary sparse, v3 header, DEFLATE grains | `open()` + `open_path()` (all-sparse only) |
+| `streamOptimized` | Binary sparse, v3 header, DEFLATE grains | `open()` + `open_path()` |
 | `twoGbMaxExtentFlat` | Text descriptor + raw extent files | `open_path()` only |
 | `monolithicFlat` | Text descriptor + single raw extent | `open_path()` only |
-| `twoGbMaxExtentSparse` | Text descriptor + binary sparse extents | `Err(UnsupportedDiskType)` |
+| `twoGbMaxExtentSparse` | Text descriptor + binary sparse extents | `open_path()` only |
 | `vmfs` | VMware ESXi internal format | Not implemented |
 
 ---
@@ -302,7 +317,7 @@ a `File` (binary VMDK) or `MultiExtentReader` (flat VMDK).
 
 ---
 
-## 11. twoGbMaxExtentSparse: layout and current rejection
+## 11. twoGbMaxExtentSparse: MultiSparseReader
 
 Each extent file in a `twoGbMaxExtentSparse` VMDK has its own binary VMDK header
 (magic `KDMV`, version 1, compress=0). The descriptor (`disk.vmdk`) is a text file
@@ -321,12 +336,79 @@ disk-s001.vmdk header:
 ```
 
 Note `gd_offset=510` — not the canonical 26. Each extent has its own independent GD.
+This is normal: `twoGbMaxExtentSparse` extents are written by VMware tools that pack
+metadata at the end of each extent's pre-allocated space.
 
-To support `twoGbMaxExtentSparse`, the reader would need to:
-1. Parse SPARSE entries in the descriptor (currently ignored)
-2. Open each extent file
-3. For reads, determine which extent covers the virtual offset, then do GD/GT lookup
-   within that extent
+### MultiSparseReader implementation
+
+`sparse_multi.rs` implements `Read + Seek` over a list of `SparseEntry` values from
+the parsed text descriptor. Each extent becomes a `SparseChunk`:
+
+```
+SparseChunk {
+    byte_start / byte_end   — virtual address range
+    grain_dir               — GD loaded at open (Vec<u32>)
+    grain_size_bytes        — from per-extent header
+    num_gtes_per_gt         — from per-extent header
+    file                    — BufReader<File>
+}
+```
+
+`Read::read` clamps at the grain boundary *and* at the chunk boundary so a single
+`read()` call never crosses an extent boundary. The GD/GT/GTE lookup then mirrors the
+single-file sparse path within the matching `SparseChunk`.
+
+**Reject-if-no-extents guard:** the test corpus file `ms3-win.vmdk` lists only SPARSE
+extents whose backing files (~60 GB) are not committed. Opening via `open_path`
+returns `Err(Io(NotFound))` for the missing extent file, which is the correct failure
+mode — the error is not swallowed into a zero-byte virtual disk.
+
+---
+
+## 12. GD_AT_END: footer lookup for streamOptimized
+
+`streamOptimized` VMDKs are written sequentially — grain data is appended as it is
+produced, so the GD/GT can only be written *after* all grains are known. The primary
+header therefore carries a sentinel value for `gdOffset`:
+
+```
+#define GD_AT_END  0xffffffffffffffff
+```
+
+When `gdOffset == GD_AT_END`, the real GD offset is stored in a **footer header**
+pinned to a fixed position at the end of the file (VDF 1.1 §4.6):
+
+```
+file_end − 1024  →  SparseExtentHeader copy (footer) with real gdOffset
+file_end − 512   →  EOS marker (lba=0, size=0, type=0, 496-byte pad)
+```
+
+### Lookup path in VmdkReader::open
+
+```rust
+let gd_offset = if hdr.gd_offset == GD_AT_END {
+    reader.seek(SeekFrom::End(-1024))?;
+    let mut footer_bytes = [0u8; 512];
+    reader.read_exact(&mut footer_bytes)?;
+    SparseExtentHeader::parse(&footer_bytes)?.gd_offset
+} else {
+    hdr.gd_offset
+};
+```
+
+This runs after the descriptor is read so the `SeekFrom::End` does not interfere
+with descriptor parsing.
+
+### Why all-sparse QEMU streamOptimized disks do not trigger this
+
+QEMU's `qemu-img create -o subformat=streamOptimized` writes `gd_offset = 26` in
+the primary header (not `GD_AT_END`), because with an all-sparse disk the GD is
+trivially known at creation time and is written inline. Only streamOptimized disks
+with actual grain data use the footer pattern. The corpus file `stream_opt.vmdk` has
+`gd_offset = 26` and does **not** exercise the footer path.
+
+The footer path is exercised by the synthetic `gd_at_end_stream_opt_vmdk()` test
+helper in `testutil.rs`.
 
 ---
 
@@ -335,4 +417,6 @@ To support `twoGbMaxExtentSparse`, the reader would need to:
 | Project | File | Suggested change |
 |---------|------|-----------------|
 | VMware VDF spec | §4.2 (GTE) | Explicitly document GTE value 1 as "zeroed grain, return zeros"; note both 0 and 1 must be treated as sparse |
+| VMware VDF spec | §4.4 (compression) | Correct RFC 1951 citation to RFC 1950; wire format is zlib-wrapped (2-byte header + DEFLATE + Adler-32), not raw DEFLATE |
 | QEMU | `block/vmdk.c` | Add comment at GTE decode explaining 0/1 sparse cases with spec §4.2 reference |
+| QEMU | `block/vmdk.c` | Add comment near grain compression noting the RFC 1950 vs RFC 1951 discrepancy with the spec |
