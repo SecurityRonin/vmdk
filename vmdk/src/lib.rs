@@ -5,6 +5,7 @@
 //! VMDKs (`twoGbMaxExtentFlat`, `monolithicFlat`), and multi-file sparse
 //! extents (`twoGbMaxExtentSparse`).
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -133,6 +134,9 @@ pub struct VmdkReader<R: Read + Seek> {
     cid: u32,
     parent_cid: u32,
     descriptor_text: Box<str>,
+    /// Cache of grain tables: maps GT sector number → Vec of GTE values.
+    /// Avoids redundant seeks for repeated grain reads within the same GT.
+    gt_cache: HashMap<u32, Vec<u32>>,
 }
 
 /// Maximum bytes read from an embedded descriptor (guards against crafted images).
@@ -251,6 +255,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             cid: desc.cid,
             parent_cid: desc.parent_cid,
             descriptor_text: desc.raw_text,
+            gt_cache: HashMap::new(),
         })
     }
 
@@ -386,12 +391,12 @@ impl<R: Read + Seek> VmdkReader<R> {
         Ok(result)
     }
 
-    /// Number of grain-table entries currently held in the GT cache.
+    /// Number of grain tables currently held in the GT cache.
     ///
     /// Exposed for testing; not part of the stable public API.
     #[doc(hidden)]
     pub fn gt_cache_size(&self) -> usize {
-        todo!("gt_cache_size not yet implemented")
+        self.gt_cache.len()
     }
 
     /// Resolve `virtual_offset` to a [`GrainLookup`] describing where to find the data.
@@ -416,11 +421,27 @@ impl<R: Read + Seek> VmdkReader<R> {
         if gt_sector == 0 {
             return Ok(GrainLookup::Sparse);
         }
-        let gte_file_pos = u64::from(gt_sector) * SECTOR_SIZE + gte_idx * 4;
-        self.inner.seek(SeekFrom::Start(gte_file_pos))?;
-        let mut gte_bytes = [0u8; 4];
-        self.inner.read_exact(&mut gte_bytes)?;
-        let gte = u32::from_le_bytes(gte_bytes);
+        // Use cached GT if available; otherwise read from file and cache it.
+        let gte = if let Some(gt) = self.gt_cache.get(&gt_sector) {
+            gt.get(gte_idx as usize).copied().unwrap_or(0)
+        } else {
+            // Read the full GT (num_gtes_per_gt entries × 4 bytes) into the cache.
+            let gt_byte_offset = u64::from(gt_sector) * SECTOR_SIZE;
+            self.inner.seek(SeekFrom::Start(gt_byte_offset))?;
+            let gt_size = {
+                let FormatState::Sparse { num_gtes_per_gt, .. } = &self.fmt else { unreachable!() };
+                *num_gtes_per_gt as usize * 4
+            };
+            let mut gt_bytes = vec![0u8; gt_size];
+            self.inner.read_exact(&mut gt_bytes)?;
+            let gt: Vec<u32> = gt_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+                .collect();
+            let gte = gt.get(gte_idx as usize).copied().unwrap_or(0);
+            self.gt_cache.insert(gt_sector, gt);
+            gte
+        };
         if gte <= 1 {
             return Ok(GrainLookup::Sparse); // sparse or explicitly-zeroed grain
         }
@@ -522,6 +543,7 @@ impl VmdkFileReader {
                         cid: desc.cid,
                         parent_cid: desc.parent_cid,
                         descriptor_text: desc.raw_text,
+                        gt_cache: HashMap::new(),
                     })
                 }
                 "twoGbMaxExtentSparse" => {
@@ -540,6 +562,7 @@ impl VmdkFileReader {
                         cid: desc.cid,
                         parent_cid: desc.parent_cid,
                         descriptor_text: desc.raw_text,
+                        gt_cache: HashMap::new(),
                     })
                 }
                 _ => Err(VmdkError::UnsupportedDiskType(
@@ -566,6 +589,7 @@ impl<R: Read + Seek + Send + 'static> VmdkReader<R> {
             cid: self.cid,
             parent_cid: self.parent_cid,
             descriptor_text: self.descriptor_text,
+            gt_cache: self.gt_cache,
         }
     }
 }
