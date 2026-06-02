@@ -8,7 +8,7 @@
 //! Reference: QEMU `vmdk.c` `vmdk_open_vmfs_sparse()`;
 //! libvmdk `cowd_sparse_file_header.h`.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::VmdkError;
 
@@ -21,21 +21,17 @@ const COWD_GD_SECTOR: u32 = 4;
 /// Fixed number of GTEs per grain table in COWD format.
 pub(crate) const COWD_GTES_PER_GT: usize = 4096;
 
-/// Size of a single grain table in bytes (4096 × 4 bytes).
-const COWD_GT_BYTES: usize = COWD_GTES_PER_GT * 4;
-
 /// Sector size (shared with VMDK4).
 const SECTOR_SIZE: u64 = 512;
 
 /// Parsed COWD sparse extent header.
 ///
-/// The raw header is 1060 bytes (root file) but we only read the first 32 bytes
-/// that contain the fields needed for grain-table navigation.
+/// The raw header is 1060 bytes (root file) but we only read the fields needed
+/// for grain-table navigation. `gd_entries` (offset 24) and `next_free`
+/// (offset 28) are present in the wire format but unused for read-only access.
 pub(crate) struct CowdHeader {
-    pub capacity: u32,    // virtual disk size in sectors (32-bit limit)
-    pub grain_size: u32,  // grain size in sectors
-    pub gd_entries: u32,  // number of grain directory entries
-    pub next_free: u32,   // next free sector (ignored for read-only use)
+    pub capacity: u32,   // virtual disk size in sectors (32-bit limit)
+    pub grain_size: u32, // grain size in sectors
 }
 
 impl CowdHeader {
@@ -63,10 +59,7 @@ impl CowdHeader {
             return Err(VmdkError::InvalidGeometry("COWD grain_size must be > 0".into()));
         }
 
-        let gd_entries = u32::from_le_bytes(data[24..28].try_into().expect("4 bytes"));
-        let next_free = u32::from_le_bytes(data[28..32].try_into().expect("4 bytes"));
-
-        Ok(CowdHeader { capacity, grain_size, gd_entries, next_free })
+        Ok(CowdHeader { capacity, grain_size })
     }
 }
 
@@ -110,28 +103,9 @@ pub(crate) fn open_cowd<R: Read + Seek>(
     Ok((grain_dir, grain_size_bytes))
 }
 
-/// Look up a GTE in a COWD extent.
-///
-/// Returns the sector offset of the grain data, or 0 if the grain is unallocated.
-pub(crate) fn cowd_lookup_gte<R: Read + Seek>(
-    reader: &mut R,
-    grain_dir: &[u32],
-    grain_size_bytes: u64,
-    virtual_offset: u64,
-) -> io::Result<u32> {
-    let grain_idx = virtual_offset / grain_size_bytes;
-    let gd_idx = (grain_idx / COWD_GTES_PER_GT as u64) as usize;
-    let gte_idx = (grain_idx % COWD_GTES_PER_GT as u64) as usize;
-    let gt_sector = grain_dir.get(gd_idx).copied().unwrap_or(0);
-    if gt_sector == 0 {
-        return Ok(0);
-    }
-    let gte_offset = u64::from(gt_sector) * SECTOR_SIZE + (gte_idx * 4) as u64;
-    reader.seek(SeekFrom::Start(gte_offset))?;
-    let mut gte_bytes = [0u8; 4];
-    reader.read_exact(&mut gte_bytes)?;
-    Ok(u32::from_le_bytes(gte_bytes))
-}
+// COWD grain lookups reuse the generic `grain_location` path in lib.rs once the
+// grain directory is loaded (COWD GTEs are 4-byte sector offsets, identical in
+// layout to VMDK4), so no COWD-specific GTE lookup helper is needed here.
 
 #[cfg(test)]
 mod tests {
@@ -162,7 +136,6 @@ mod tests {
         let hdr = CowdHeader::parse(&h).expect("parse");
         assert_eq!(hdr.capacity, 1024);
         assert_eq!(hdr.grain_size, 8);
-        assert_eq!(hdr.gd_entries, 1);
     }
 
     #[test]
@@ -197,8 +170,8 @@ mod tests {
         let mut gd = vec![0u8; 512];
         gd[0..4].copy_from_slice(&5u32.to_le_bytes());
         bytes.extend_from_slice(&gd);
-        // sector 5: GT (4096 entries, all zero = sparse)
-        bytes.extend_from_slice(&vec![0u8; COWD_GT_BYTES]);
+        // sector 5: GT (4096 entries × 4 bytes, all zero = sparse)
+        bytes.extend_from_slice(&vec![0u8; COWD_GTES_PER_GT * 4]);
 
         let (grain_dir, gsz) = open_cowd(Cursor::new(bytes)).expect("open_cowd");
         assert_eq!(grain_dir.len(), 1);

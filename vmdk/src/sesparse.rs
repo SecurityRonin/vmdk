@@ -12,7 +12,7 @@
 //! Reference: QEMU `vmdk.c` `vmdk_open_se_sparse()`;
 //! strict version check: `version == 0x0000_0002_0000_0001`.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::VmdkError;
 
@@ -35,13 +35,10 @@ const SECTOR_SIZE: u64 = 512;
 
 /// Parsed seSparse constant header (first 512 bytes of the extent file).
 pub(crate) struct SeConstHeader {
-    pub capacity: u64,          // virtual disk size in sectors
-    pub grain_size: u64,        // must be 8
-    pub grain_table_size: u64,  // must be 64
-    pub gd_offset: u64,         // grain directory sector offset
-    pub gd_size: u64,           // grain directory size in sectors
-    pub gt_offset: u64,         // start of grain tables (sectors)
-    pub grains_offset: u64,     // start of grain data (sectors)
+    pub capacity: u64,   // virtual disk size in sectors
+    pub grain_size: u64, // must be 8
+    pub gd_offset: u64,  // grain directory sector offset
+    pub gt_offset: u64,  // start of grain tables (sectors)
 }
 
 impl SeConstHeader {
@@ -71,14 +68,13 @@ impl SeConstHeader {
                 format!("seSparse grain_table_size must be {SE_GT_SECTORS}, got {grain_table_size}"),
             ));
         }
-        // Volatile header offset (sectors) at offset 80.
-        // Grain directory offset at offset 128.
+        // Wire layout also carries gd_size (136), grain_table_size validated above (32),
+        // and grains_offset (192); none are needed for read-only navigation.
+        // Grain directory offset at offset 128; grain tables at offset 144.
         let gd_offset = u64::from_le_bytes(data[128..136].try_into().expect("8 bytes"));
-        let gd_size = u64::from_le_bytes(data[136..144].try_into().expect("8 bytes"));
         let gt_offset = u64::from_le_bytes(data[144..152].try_into().expect("8 bytes"));
-        let grains_offset = u64::from_le_bytes(data[192..200].try_into().expect("8 bytes"));
 
-        Ok(SeConstHeader { capacity, grain_size, grain_table_size, gd_offset, gd_size, gt_offset, grains_offset })
+        Ok(SeConstHeader { capacity, grain_size, gd_offset, gt_offset })
     }
 }
 
@@ -119,32 +115,9 @@ pub(crate) fn open_sesparse<R: Read + Seek>(
     Ok((grain_dir, grain_size_bytes, SE_GTES_PER_GT))
 }
 
-/// Look up a GTE in a seSparse extent.
-///
-/// Returns the sector offset of the grain data, or 0 if the grain is unallocated.
-/// seSparse GTEs are 8 bytes (u64) and store the grain sector offset directly.
-pub(crate) fn sesparse_lookup_gte<R: Read + Seek>(
-    reader: &mut R,
-    grain_dir: &[u64],
-    grain_size_bytes: u64,
-    virtual_offset: u64,
-    gt_offset_sectors: u64,
-) -> io::Result<u64> {
-    let grain_idx = virtual_offset / grain_size_bytes;
-    let gd_idx = (grain_idx / SE_GTES_PER_GT) as usize;
-    let gte_idx = grain_idx % SE_GTES_PER_GT;
-    let gt_table_idx = grain_dir.get(gd_idx).copied().unwrap_or(0);
-    if gt_table_idx == 0 {
-        return Ok(0);
-    }
-    // GT table index is 0-based; actual sector = gt_offset_sectors + (gt_table_idx - 1) * SE_GT_SECTORS
-    let gt_sector = gt_offset_sectors + (gt_table_idx - 1) * SE_GT_SECTORS;
-    let gte_offset = gt_sector * SECTOR_SIZE + gte_idx * 8;
-    reader.seek(SeekFrom::Start(gte_offset))?;
-    let mut gte_bytes = [0u8; 8];
-    reader.read_exact(&mut gte_bytes)?;
-    Ok(u64::from_le_bytes(gte_bytes))
-}
+// seSparse GTE lookups are handled inline in lib.rs `grain_location` (8-byte GTEs,
+// GT table index resolved via gt_offset + (idx-1)*SE_GT_SECTORS), so no separate
+// lookup helper is needed here.
 
 #[cfg(test)]
 mod tests {
@@ -176,8 +149,8 @@ mod tests {
         let hdr = SeConstHeader::parse(&h).expect("parse");
         assert_eq!(hdr.capacity, 4096);
         assert_eq!(hdr.grain_size, 8);
-        assert_eq!(hdr.grain_table_size, 64);
         assert_eq!(hdr.gd_offset, 10);
+        assert_eq!(hdr.gt_offset, 11);
     }
 
     #[test]

@@ -9,9 +9,8 @@ pub(crate) struct TextDescriptor {
     pub cid: u32,
     /// Parent content ID (hex field `parentCID=`); `0xffff_ffff` when absent or base image.
     pub parent_cid: u32,
-    /// Hint filename for the parent VMDK (`parentFileNameHint=`); empty when absent.
-    pub parent_file_name: Box<str>,
     /// Raw descriptor text (NUL bytes stripped; used by `VmdkReader::descriptor_text()`).
+    /// `parentFileNameHint` is recovered from this text by the chain reader when needed.
     pub raw_text: Box<str>,
     /// FLAT extents (twoGbMaxExtentFlat, monolithicFlat).
     pub extents: Vec<ExtentEntry>,
@@ -44,7 +43,6 @@ pub(crate) fn parse_text_descriptor(text: &str) -> Result<TextDescriptor> {
     let mut create_type = Box::from("");
     let mut cid: u32 = 0xffff_ffff;
     let mut parent_cid: u32 = 0xffff_ffff;
-    let mut parent_file_name = Box::from("");
     let mut extents = Vec::new();
     let mut sparse_extents = Vec::new();
     let mut capacity_sectors = 0u64;
@@ -73,10 +71,6 @@ pub(crate) fn parse_text_descriptor(text: &str) -> Result<TextDescriptor> {
             parent_cid = u32::from_str_radix(rest.trim(), 16).unwrap_or(0xffff_ffff);
             continue;
         }
-        if let Some(rest) = line.strip_prefix("parentFileNameHint=") {
-            parent_file_name = Box::from(rest.trim().trim_matches('"'));
-            continue;
-        }
         if let Some(ext) = try_parse_flat_extent(line) {
             capacity_sectors = capacity_sectors
                 .checked_add(ext.size_sectors)
@@ -96,7 +90,6 @@ pub(crate) fn parse_text_descriptor(text: &str) -> Result<TextDescriptor> {
         create_type,
         cid,
         parent_cid,
-        parent_file_name,
         raw_text: Box::from(text_clean),
         extents,
         sparse_extents,
