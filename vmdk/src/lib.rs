@@ -386,6 +386,14 @@ impl<R: Read + Seek> VmdkReader<R> {
         Ok(result)
     }
 
+    /// Number of grain-table entries currently held in the GT cache.
+    ///
+    /// Exposed for testing; not part of the stable public API.
+    #[doc(hidden)]
+    pub fn gt_cache_size(&self) -> usize {
+        todo!("gt_cache_size not yet implemented")
+    }
+
     /// Resolve `virtual_offset` to a [`GrainLookup`] describing where to find the data.
     fn grain_location(&mut self, virtual_offset: u64) -> io::Result<GrainLookup> {
         let (gt_sector, gte_idx, offset_in_grain, compressed, grain_size_bytes) = {
@@ -756,6 +764,35 @@ mod tests {
             bytes.extend_from_slice(&suffix);
             let _ = VmdkReader::open(Cursor::new(bytes));
         }
+    }
+
+    // ── GT cache ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn gt_cache_grows_on_grain_read() {
+        let vmdk = test_sparse_vmdk(&[0u8; 512]);
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        assert_eq!(reader.gt_cache_size(), 0, "cache starts empty");
+        let mut buf = [0u8; 512];
+        reader.read_exact(&mut buf).expect("read");
+        assert_eq!(reader.gt_cache_size(), 1, "one GT loaded after first grain read");
+    }
+
+    #[test]
+    fn gt_cache_no_double_load_on_second_read_same_grain() {
+        let vmdk = test_sparse_vmdk(&[0xABu8; 512]);
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        let mut buf = [0u8; 512];
+        reader.read_exact(&mut buf).expect("first read");
+        let after_first = reader.gt_cache_size();
+        reader.seek(SeekFrom::Start(0)).expect("seek back");
+        reader.read_exact(&mut buf).expect("second read");
+        assert_eq!(
+            reader.gt_cache_size(),
+            after_first,
+            "cache must not grow on second read of same GT"
+        );
+        assert_eq!(buf[0], 0xAB, "data must still be correct");
     }
 
     // ── is_allocated / iter_allocated_grains ─────────────────────────────────
