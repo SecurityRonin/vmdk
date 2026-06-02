@@ -22,7 +22,8 @@ pub struct SparseExtentHeader {
     pub descriptor_offset: u64, // in sectors
     pub descriptor_size: u64,   // in sectors
     pub num_gtes_per_gt: u32,
-    pub gd_offset: u64, // grain directory offset in sectors
+    pub rgd_offset: u64, // redundant grain directory offset in sectors (0 if absent)
+    pub gd_offset: u64,  // grain directory offset in sectors
     /// `true` when `compress_algorithm == 1` (stream-optimised / DEFLATE).
     pub compressed: bool,
 }
@@ -48,6 +49,7 @@ impl SparseExtentHeader {
         let descriptor_offset = u64::from_le_bytes(data[28..36].try_into().expect("8 bytes"));
         let descriptor_size = u64::from_le_bytes(data[36..44].try_into().expect("8 bytes"));
         let num_gtes_per_gt = u32::from_le_bytes(data[44..48].try_into().expect("4 bytes"));
+        let rgd_offset = u64::from_le_bytes(data[48..56].try_into().expect("8 bytes"));
         let gd_offset = u64::from_le_bytes(data[56..64].try_into().expect("8 bytes"));
         let compress_algorithm = u16::from_le_bytes(data[77..79].try_into().expect("2 bytes"));
 
@@ -81,6 +83,7 @@ impl SparseExtentHeader {
             descriptor_offset,
             descriptor_size,
             num_gtes_per_gt,
+            rgd_offset,
             gd_offset,
             compressed: compress_algorithm != 0,
         })

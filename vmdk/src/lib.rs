@@ -160,6 +160,10 @@ pub struct VmdkReader<R: Read + Seek> {
     cid: u32,
     parent_cid: u32,
     descriptor_text: Box<str>,
+    /// RGD (redundant grain directory) sector offset; 0 when absent.
+    rgd_offset: u64,
+    /// Number of GD entries — stored for RGD validation without re-deriving.
+    gd_entry_count: usize,
     /// Cache of grain tables: maps GT sector number → Vec of GTE values.
     /// Avoids redundant seeks for repeated grain reads within the same GT.
     gt_cache: HashMap<u32, Vec<u32>>,
@@ -295,6 +299,8 @@ impl<R: Read + Seek> VmdkReader<R> {
             cid: desc.cid,
             parent_cid: desc.parent_cid,
             descriptor_text: desc.raw_text,
+            rgd_offset: hdr.rgd_offset,
+            gd_entry_count: num_gts as usize,
             gt_cache: HashMap::new(),
         })
     }
@@ -309,6 +315,36 @@ impl<R: Read + Seek> VmdkReader<R> {
     /// Returns an empty string when no embedded descriptor is present.
     pub fn disk_type(&self) -> &str {
         &self.disk_type
+    }
+
+    /// Validate the redundant grain directory (RGD) against the primary GD.
+    ///
+    /// Returns `Ok(true)` if both directories are present and identical,
+    /// `Ok(false)` if the RGD is absent or mismatches (indicating corruption),
+    /// and `Err(_)` on I/O failure.
+    ///
+    /// For flat and COWD/seSparse formats (which have no RGD) this always returns `Ok(false)`.
+    pub fn validate_rgd(&mut self) -> io::Result<bool> {
+        let (primary_gd, rgd_offset, gd_entry_count) = match &self.fmt {
+            FormatState::Sparse { grain_dir, .. } => {
+                (grain_dir.clone(), self.rgd_offset, self.gd_entry_count)
+            }
+            _ => return Ok(false), // Flat/seSparse/COWD have no RGD
+        };
+        if rgd_offset == 0 || rgd_offset == crate::header::GD_AT_END {
+            return Ok(false);
+        }
+        let rgd_byte_offset = rgd_offset
+            .checked_mul(SECTOR_SIZE)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "rgd_offset overflow"))?;
+        self.inner.seek(SeekFrom::Start(rgd_byte_offset))?;
+        let mut rgd_bytes = vec![0u8; gd_entry_count * 4];
+        self.inner.read_exact(&mut rgd_bytes)?;
+        let rgd: Vec<u32> = rgd_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+            .collect();
+        Ok(primary_gd == rgd)
     }
 
     /// CID from the embedded descriptor; `0xffff_ffff` when absent.
@@ -383,6 +419,8 @@ impl<R: Read + Seek> VmdkReader<R> {
             cid: 0xffff_ffff,
             parent_cid: 0xffff_ffff,
             descriptor_text: Box::from(""),
+            rgd_offset: 0,
+            gd_entry_count: 0,
             gt_cache: HashMap::new(),
         })
     }
@@ -419,6 +457,8 @@ impl<R: Read + Seek> VmdkReader<R> {
             cid: 0xffff_ffff,
             parent_cid: 0xffff_ffff,
             descriptor_text: Box::from(""),
+            rgd_offset: 0,
+            gd_entry_count: 0,
             gt_cache: HashMap::new(),
         })
     }
@@ -763,7 +803,9 @@ impl VmdkFileReader {
                         cid: desc.cid,
                         parent_cid: desc.parent_cid,
                         descriptor_text: desc.raw_text,
-                        gt_cache: HashMap::new(),
+                        rgd_offset: 0,
+            gd_entry_count: 0,
+            gt_cache: HashMap::new(),
                     })
                 }
                 // ESXi sparse formats: SPARSE/VMFSSPARSE extent type — binary VMDK4 or COWD.
@@ -783,7 +825,9 @@ impl VmdkFileReader {
                         cid: desc.cid,
                         parent_cid: desc.parent_cid,
                         descriptor_text: desc.raw_text,
-                        gt_cache: HashMap::new(),
+                        rgd_offset: 0,
+            gd_entry_count: 0,
+            gt_cache: HashMap::new(),
                     })
                 }
                 _ => Err(VmdkError::UnsupportedDiskType(
@@ -810,6 +854,8 @@ impl<R: Read + Seek + Send + 'static> VmdkReader<R> {
             cid: self.cid,
             parent_cid: self.parent_cid,
             descriptor_text: self.descriptor_text,
+            rgd_offset: self.rgd_offset,
+            gd_entry_count: self.gd_entry_count,
             gt_cache: self.gt_cache,
         }
     }
@@ -1008,6 +1054,30 @@ mod tests {
             bytes.extend_from_slice(&suffix);
             let _ = VmdkReader::open(Cursor::new(bytes));
         }
+    }
+
+    // ── RGD validation ───────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_rgd_returns_true_for_valid_sparse_vmdk() {
+        // test_sparse_vmdk builds a VMDK with matching GD and RGD.
+        let vmdk = test_sparse_vmdk(&[0u8; 512]);
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        assert!(
+            reader.validate_rgd().expect("validate_rgd"),
+            "test_sparse_vmdk must have valid (matching) RGD"
+        );
+    }
+
+    #[test]
+    fn validate_rgd_returns_false_for_flat_format() {
+        let vmdk = gd_at_end_stream_opt_vmdk(); // streamOptimized, no RGD
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        // streamOptimized with GD_AT_END: rgd_offset=0, returns false
+        assert!(
+            !reader.validate_rgd().expect("validate_rgd flat"),
+            "streamOptimized with no RGD must return false"
+        );
     }
 
     // ── VMFS flat / ZERO extent descriptor parsing ───────────────────────────
