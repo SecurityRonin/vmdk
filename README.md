@@ -118,7 +118,7 @@ Virtual offset resolution is O(1): one GD lookup (in-memory `Vec<u32>`) + one GT
 - External validation against pWnOS v2.0 (VulnHub, VMware Workstation 7, 40 GiB sparse image)
   and Metasploitable3 Windows 2008 (Rapid7, VMware Workstation 13, `twoGbMaxExtentSparse`)
 
-See [docs/corpus-validation.md](docs/corpus-validation.md) for detailed results and reproduction steps.
+See [docs/validation.md](docs/validation.md) for detailed results and reproduction steps.
 
 ## Related crates
 
