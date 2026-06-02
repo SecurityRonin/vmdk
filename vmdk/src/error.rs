@@ -16,4 +16,6 @@ pub enum VmdkError {
     FileTooSmall,
     #[error("invalid VMDK geometry: {0}")]
     InvalidGeometry(String),
+    #[error("unsupported VMDK disk type: {0}")]
+    UnsupportedDiskType(String),
 }

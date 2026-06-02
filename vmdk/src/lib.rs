@@ -255,6 +255,16 @@ impl VmdkFileReader {
             // Text descriptor: parse extents and build a multi-file reader.
             let text = std::fs::read_to_string(path)?;
             let desc = parse_text_descriptor(&text)?;
+
+            // Reject descriptors whose extents are entirely non-FLAT (e.g.
+            // twoGbMaxExtentSparse). Returning Ok with 0 bytes would silently
+            // mislead callers into thinking the disk is empty.
+            if desc.extents.is_empty() && !desc.create_type.is_empty() {
+                return Err(VmdkError::UnsupportedDiskType(
+                    desc.create_type.into_string(),
+                ));
+            }
+
             let dir = path.parent().unwrap_or(Path::new("."));
             let multi = MultiExtentReader::open(dir, &desc.extents)?;
             let virtual_disk_size = desc
