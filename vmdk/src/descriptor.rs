@@ -123,9 +123,9 @@ fn try_parse_flat_extent(line: &str) -> Option<ExtentEntry> {
     let size_sectors: u64 = sectors_str.parse().ok()?;
     rest = tail;
 
-    // Extent type — only FLAT is supported here
+    // Extent type — FLAT and VMFS are flat (preallocated) extent types
     let (ext_type, tail) = split_token(rest)?;
-    if ext_type != "FLAT" {
+    if !matches!(ext_type, "FLAT" | "VMFS") {
         return None;
     }
     rest = tail.trim_start();
@@ -165,7 +165,8 @@ fn try_parse_sparse_extent(line: &str) -> Option<SparseEntry> {
     rest = tail;
 
     let (ext_type, tail) = split_token(rest)?;
-    if ext_type != "SPARSE" {
+    // SPARSE is standard VMDK4 sparse; VMFSSPARSE is COWD-based ESXi sparse.
+    if !matches!(ext_type, "SPARSE" | "VMFSSPARSE") {
         return None;
     }
     rest = tail.trim_start();

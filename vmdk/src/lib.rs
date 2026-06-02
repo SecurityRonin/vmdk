@@ -745,7 +745,9 @@ impl VmdkFileReader {
             let dir = path.parent().unwrap_or(Path::new("."));
 
             match desc.create_type.as_ref() {
-                "twoGbMaxExtentFlat" | "monolithicFlat" => {
+                // ESXi flat formats (preallocated): FLAT/VMFS extent type — raw bytes.
+                "vmfs" | "vmfsPreallocated" | "vmfsEagerZeroedThick" | "vmfsRDM"
+                | "twoGbMaxExtentFlat" | "monolithicFlat" => {
                     let multi = MultiExtentReader::open(dir, &desc.extents)?;
                     let virtual_disk_size = desc
                         .capacity_sectors
@@ -764,7 +766,8 @@ impl VmdkFileReader {
                         gt_cache: HashMap::new(),
                     })
                 }
-                "twoGbMaxExtentSparse" => {
+                // ESXi sparse formats: SPARSE/VMFSSPARSE extent type — binary VMDK4 or COWD.
+                "vmfsSparse" | "vmfsThin" | "twoGbMaxExtentSparse" => {
                     let multi = MultiSparseReader::open(dir, &desc.sparse_extents)?;
                     let virtual_disk_size = desc
                         .sparse_capacity_sectors

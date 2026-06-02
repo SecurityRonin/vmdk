@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::cowd::{self, COWD_GTES_PER_GT};
 use crate::descriptor::SparseEntry;
 use crate::header::{SparseExtentHeader, SECTOR_SIZE};
 
@@ -36,6 +37,29 @@ impl MultiSparseReader {
 
             let mut hdr_bytes = [0u8; 512];
             file.read_exact(&mut hdr_bytes)?;
+
+            // Detect COWD extent (vmfsSparse/vmfsThin) vs standard VMDK4.
+            let magic_be = u32::from_be_bytes(hdr_bytes[0..4].try_into().expect("4 bytes"));
+            if magic_be == cowd::COWD_MAGIC {
+                file.seek(SeekFrom::Start(0))?;
+                let (grain_dir, grain_size_bytes) = cowd::open_cowd(&mut file)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                let byte_end = byte_offset + u64::from(
+                    cowd::CowdHeader::parse(&hdr_bytes)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?.capacity
+                ) * SECTOR_SIZE;
+                chunks.push(SparseChunk {
+                    byte_start: byte_offset,
+                    byte_end,
+                    grain_dir,
+                    grain_size_bytes,
+                    num_gtes_per_gt: COWD_GTES_PER_GT as u64,
+                    file,
+                });
+                byte_offset = byte_end;
+                continue;
+            }
+
             let hdr = SparseExtentHeader::parse(&hdr_bytes)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
