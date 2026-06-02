@@ -1,5 +1,7 @@
 //! Minimal valid sparse VMDK builder for use in tests and downstream crates.
 
+use std::path::Path;
+
 use super::header::{MAGIC, SECTOR_SIZE, VERSION, VERSION_STREAM_OPT};
 
 // Layout constants (all in sectors unless noted):
@@ -69,6 +71,87 @@ pub fn test_sparse_vmdk(sector_data: &[u8]) -> Vec<u8> {
     vmdk.extend_from_slice(&gt);
     vmdk.extend_from_slice(&grain);
     vmdk
+}
+
+/// Build a monolithicSparse VMDK with a custom descriptor string embedded.
+///
+/// Used to construct snapshot chains with `parentCID` and `parentFileNameHint`.
+#[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
+pub fn test_sparse_vmdk_with_descriptor(sector_data: &[u8], descriptor_text: &str) -> Vec<u8> {
+    let mut grain = vec![0u8; GRAIN_SIZE_BYTES];
+    let copy_len = sector_data.len().min(GRAIN_SIZE_BYTES);
+    grain[..copy_len].copy_from_slice(&sector_data[..copy_len]);
+
+    let mut hdr = vec![0u8; 512];
+    hdr[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    hdr[4..8].copy_from_slice(&VERSION.to_le_bytes());
+    hdr[12..20].copy_from_slice(&GRAIN_SIZE_SECTORS.to_le_bytes());
+    hdr[20..28].copy_from_slice(&GRAIN_SIZE_SECTORS.to_le_bytes());
+    hdr[28..36].copy_from_slice(&DESCRIPTOR_OFFSET.to_le_bytes());
+    hdr[36..44].copy_from_slice(&DESCRIPTOR_SECTORS.to_le_bytes());
+    hdr[44..48].copy_from_slice(&NUM_GTES_PER_GT.to_le_bytes());
+    hdr[48..56].copy_from_slice(&RGD_SECTOR.to_le_bytes());
+    hdr[56..64].copy_from_slice(&GD_SECTOR.to_le_bytes());
+    hdr[64..72].copy_from_slice(&GRAIN_SECTOR.to_le_bytes());
+    hdr[72] = 0;
+    hdr[73] = b'\n';
+    hdr[74] = b' ';
+    hdr[75] = b'\r';
+    hdr[76] = b'\n';
+    hdr[77..79].copy_from_slice(&0u16.to_le_bytes());
+
+    let mut desc = vec![0u8; DESCRIPTOR_SECTORS as usize * SECTOR_SIZE as usize];
+    let n = descriptor_text.len().min(desc.len());
+    desc[..n].copy_from_slice(&descriptor_text.as_bytes()[..n]);
+
+    let mut gd = vec![0u8; SECTOR_SIZE as usize];
+    gd[0..4].copy_from_slice(&(GT_SECTOR as u32).to_le_bytes());
+    let rgd = gd.clone();
+
+    let mut gt = vec![0u8; GT_SECTORS as usize * SECTOR_SIZE as usize];
+    gt[0..4].copy_from_slice(&(GRAIN_SECTOR as u32).to_le_bytes());
+
+    let mut vmdk = Vec::new();
+    vmdk.extend_from_slice(&hdr);
+    vmdk.extend_from_slice(&desc);
+    vmdk.extend_from_slice(&gd);
+    vmdk.extend_from_slice(&rgd);
+    vmdk.extend_from_slice(&gt);
+    vmdk.extend_from_slice(&grain);
+    vmdk
+}
+
+/// Write a base VMDK and delta VMDK to `dir`, returning `(base_path, delta_path)`.
+///
+/// The base has `CID=00000001` (grain 0 = `base_data`); the delta has `CID=00000002`,
+/// `parentCID=00000001`, `parentFileNameHint="base.vmdk"` (grain 0 sparse → read from base).
+///
+/// Reading grain 0 from the chain should yield `base_data`.
+#[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
+pub fn write_chain_to_dir(
+    dir: &Path,
+    base_data: &[u8],
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::io::Write as _;
+
+    let base_desc = "# Disk DescriptorFile\nversion=1\nCID=00000001\nparentCID=ffffffff\ncreateType=\"monolithicSparse\"\n";
+    let base_bytes = test_sparse_vmdk_with_descriptor(base_data, base_desc);
+    let base_path = dir.join("base.vmdk");
+    std::fs::File::create(&base_path).unwrap().write_all(&base_bytes).unwrap();
+
+    // Delta has grain 0 sparse (all-zeros grain table) so reads fall through to base.
+    let delta_desc = "# Disk DescriptorFile\nversion=1\nCID=00000002\nparentCID=00000001\nparentFileNameHint=\"base.vmdk\"\ncreateType=\"monolithicSparse\"\n";
+    // Build a delta where grain 0 is sparse (GTE=0).
+    let mut delta_bytes = test_sparse_vmdk_with_descriptor(&[], delta_desc);
+    // Patch GT[0] to 0 (sparse) — already zero by default in test_sparse_vmdk_with_descriptor
+    // since sector_data is empty. But test_sparse_vmdk_with_descriptor always sets GTE[0]=GRAIN_SECTOR.
+    // We need to zero out GTE[0] so it's sparse in the delta.
+    let gt_offset = (GT_SECTOR as usize) * SECTOR_SIZE as usize;
+    delta_bytes[gt_offset..gt_offset + 4].copy_from_slice(&0u32.to_le_bytes());
+    let delta_path = dir.join("delta.vmdk");
+    std::fs::File::create(&delta_path).unwrap().write_all(&delta_bytes).unwrap();
+
+    (base_path, delta_path)
 }
 
 // ── streamOptimized GD_AT_END layout constants ────────────────────────────────

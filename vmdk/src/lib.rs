@@ -10,11 +10,14 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+mod chain;
 mod descriptor;
 pub(crate) mod error;
 mod flat;
 mod header;
 mod sparse_multi;
+
+pub use chain::VmdkChainReader;
 
 pub use error::VmdkError;
 
@@ -284,6 +287,16 @@ impl<R: Read + Seek> VmdkReader<R> {
     /// Returns an empty string when no embedded descriptor is present.
     pub fn disk_type(&self) -> &str {
         &self.disk_type
+    }
+
+    /// CID from the embedded descriptor; `0xffff_ffff` when absent.
+    pub fn cid(&self) -> u32 {
+        self.cid
+    }
+
+    /// Parent CID; `0xffff_ffff` means this is a base image (no parent).
+    pub fn parent_cid(&self) -> u32 {
+        self.parent_cid
     }
 
     /// Virtual disk size in 512-byte sectors.
