@@ -91,54 +91,62 @@ pub fn test_sesparse_vmdk(sector_data: &[u8]) -> Vec<u8> {
 
     const GRAIN_SECTORS: u64 = 8;
     const GRAIN_BYTES: usize = GRAIN_SECTORS as usize * SECTOR_SIZE as usize;
-    const GD_SECTOR: u64 = 10;
-    const GT_OFFSET: u64 = 11;   // first GT table starts at sector 11
-    const GRAIN_SECTOR: u64 = GT_OFFSET + SE_GT_SECTORS; // = 75
+    // Layout (QEMU-compatible — see sesparse-encoding memory):
+    //   sector 0      : const header
+    //   sector 1      : volatile header (magic CAFECAFE)
+    //   sector 2      : grain directory (GD)
+    //   sectors 3..66 : grain table 0 (64 sectors)
+    //   sectors 67..74: grain 0 data (8 sectors)
+    const VOL_SECTOR: u64 = 1;
+    const GD_SECTOR: u64 = 2;
+    const GT_OFFSET: u64 = 3;
+    const GRAIN_SECTOR: u64 = GT_OFFSET + SE_GT_SECTORS; // = 67
     const CAPACITY: u64 = GRAIN_SECTORS; // 1 grain
+
+    // seSparse grain-entry encoding (top nibble = type):
+    //   GD entry: high32 must be 0x10000000, low32 = grain-table index
+    //   GT entry (allocated): 0x3 nibble + bit-rotated grain index
+    const GD_ALLOCATED: u64 = 0x1000_0000_0000_0000; // table index 0
+    const GT_ALLOCATED_GRAIN0: u64 = 0x3000_0000_0000_0000; // grain index 0
 
     let mut grain = vec![0u8; GRAIN_BYTES];
     let copy_len = sector_data.len().min(GRAIN_BYTES);
     grain[..copy_len].copy_from_slice(&sector_data[..copy_len]);
 
-    // Constant header (512 bytes)
+    // Constant header (512 bytes). flags / reserved / pad must stay zero (QEMU checks).
     let mut const_hdr = vec![0u8; 512];
     const_hdr[0..8].copy_from_slice(&SE_CONST_MAGIC.to_le_bytes());
     const_hdr[8..16].copy_from_slice(&SE_VERSION.to_le_bytes());
     const_hdr[16..24].copy_from_slice(&CAPACITY.to_le_bytes());
     const_hdr[24..32].copy_from_slice(&GRAIN_SECTORS.to_le_bytes()); // grain_size
     const_hdr[32..40].copy_from_slice(&SE_GT_SECTORS.to_le_bytes()); // grain_table_size
-    const_hdr[80..88].copy_from_slice(&1u64.to_le_bytes()); // volatile hdr offset
+    const_hdr[80..88].copy_from_slice(&VOL_SECTOR.to_le_bytes()); // volatile hdr offset
     const_hdr[88..96].copy_from_slice(&1u64.to_le_bytes()); // volatile hdr size
-    const_hdr[128..136].copy_from_slice(&GD_SECTOR.to_le_bytes()); // gd_offset
-    const_hdr[136..144].copy_from_slice(&1u64.to_le_bytes()); // gd_size
-    const_hdr[144..152].copy_from_slice(&GT_OFFSET.to_le_bytes()); // gt_offset
-    const_hdr[152..160].copy_from_slice(&(SE_GT_SECTORS + 1).to_le_bytes()); // gt_size
+    const_hdr[128..136].copy_from_slice(&GD_SECTOR.to_le_bytes()); // grain_dir_offset
+    const_hdr[136..144].copy_from_slice(&1u64.to_le_bytes()); // grain_dir_size
+    const_hdr[144..152].copy_from_slice(&GT_OFFSET.to_le_bytes()); // grain_tables_offset
+    const_hdr[152..160].copy_from_slice(&SE_GT_SECTORS.to_le_bytes()); // grain_tables_size
     const_hdr[192..200].copy_from_slice(&GRAIN_SECTOR.to_le_bytes()); // grains_offset
     const_hdr[200..208].copy_from_slice(&GRAIN_SECTORS.to_le_bytes()); // grains_size
 
-    // Volatile header (sector 1, magic CAFECAFE)
+    // Volatile header (sector 1): magic CAFECAFE, replay_journal=0, pad=0.
     let mut vol_hdr = vec![0u8; 512];
     vol_hdr[0..8].copy_from_slice(&0x0000_0000_CAFE_CAFEu64.to_le_bytes());
 
-    // Padding to sector 10
-    let padding = vec![0u8; 8 * SECTOR_SIZE as usize];
-
-    // GD at sector 10: one entry = 1 (GT table index 1)
+    // Grain directory (sector 2): GD[0] points to grain-table index 0, allocated.
     let mut gd = vec![0u8; SECTOR_SIZE as usize];
-    gd[0..8].copy_from_slice(&1u64.to_le_bytes());
+    gd[0..8].copy_from_slice(&GD_ALLOCATED.to_le_bytes());
 
-    // GT at sectors 11-74 (64 sectors = SE_GTES_PER_GT × 8 bytes)
+    // Grain table 0 (sectors 3..66): GTE[0] = allocated grain index 0.
     let mut gt = vec![0u8; SE_GTES_PER_GT as usize * 8];
-    // GTE[0] = grain sector = 75
-    gt[0..8].copy_from_slice(&GRAIN_SECTOR.to_le_bytes());
+    gt[0..8].copy_from_slice(&GT_ALLOCATED_GRAIN0.to_le_bytes());
 
     let mut vmdk = Vec::new();
-    vmdk.extend_from_slice(&const_hdr);
-    vmdk.extend_from_slice(&vol_hdr);
-    vmdk.extend_from_slice(&padding);
-    vmdk.extend_from_slice(&gd);
-    vmdk.extend_from_slice(&gt);
-    vmdk.extend_from_slice(&grain);
+    vmdk.extend_from_slice(&const_hdr); // sector 0
+    vmdk.extend_from_slice(&vol_hdr); // sector 1
+    vmdk.extend_from_slice(&gd); // sector 2
+    vmdk.extend_from_slice(&gt); // sectors 3..66
+    vmdk.extend_from_slice(&grain); // sectors 67..74
     vmdk
 }
 

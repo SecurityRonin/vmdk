@@ -13,6 +13,10 @@ categories   = ["parser-implementations", "filesystem"]
 test-helpers = []
 serde = ["dep:serde"]
 
+[[example]]
+name = "emit_fixture"
+required-features = ["test-helpers"]
+
 [dependencies]
 thiserror = "2"
 flate2    = "1"
