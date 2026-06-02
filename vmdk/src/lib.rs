@@ -37,6 +37,17 @@ impl<T: Read + Seek> ReadSeek for T {}
 /// multi-file flat extents that cannot be opened from a single stream.
 pub type VmdkFileReader = VmdkReader<Box<dyn ReadSeek + Send>>;
 
+/// A contiguous range of allocated (non-sparse) sectors in a VMDK virtual disk.
+///
+/// Returned by [`VmdkReader::iter_allocated_grains`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocatedGrain {
+    /// First LBA (512-byte sector number) of this allocated range.
+    pub start_lba: u64,
+    /// Number of sectors in this range (always a multiple of `grain_size_sectors`).
+    pub sector_count: u64,
+}
+
 /// Structured metadata for a VMDK virtual disk.
 ///
 /// Returned by [`VmdkReader::info`].  All fields are `Clone`-able so callers
@@ -287,6 +298,24 @@ impl<R: Read + Seek> VmdkReader<R> {
             compressed,
             descriptor_text: self.descriptor_text.to_string(),
         }
+    }
+
+    /// Returns `true` if the 512-byte sector at `lba` is allocated (non-sparse).
+    ///
+    /// An `lba` beyond the virtual disk boundary always returns `false`.
+    /// For flat/raw-extent VMDKs every sector is implicitly allocated; returns `true` for
+    /// any in-bounds LBA.
+    pub fn is_allocated(&mut self, lba: u64) -> io::Result<bool> {
+        todo!("is_allocated not yet implemented")
+    }
+
+    /// Iterate over all allocated (non-sparse) grain ranges in LBA order.
+    ///
+    /// Each yielded [`AllocatedGrain`] covers exactly one grain; contiguous allocated
+    /// grains are not coalesced so the caller can apply its own merging if desired.
+    /// The iterator is eager — it collects all GTE reads upfront to avoid borrow issues.
+    pub fn iter_allocated_grains(&mut self) -> io::Result<Vec<AllocatedGrain>> {
+        todo!("iter_allocated_grains not yet implemented")
     }
 
     /// Resolve `virtual_offset` to a [`GrainLookup`] describing where to find the data.
@@ -659,6 +688,56 @@ mod tests {
             bytes.extend_from_slice(&suffix);
             let _ = VmdkReader::open(Cursor::new(bytes));
         }
+    }
+
+    // ── is_allocated / iter_allocated_grains ─────────────────────────────────
+
+    #[test]
+    fn sparse_grain_is_not_allocated() {
+        // test_sparse_vmdk has grain 0 allocated (sector data) and all other grains sparse.
+        // Sectors beyond grain 0 should report not-allocated.
+        let vmdk = test_sparse_vmdk(&[0u8; 512]);
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        // Grain 0 is allocated (GTE != 0).
+        assert!(
+            reader.is_allocated(0).expect("is_allocated lba=0"),
+            "grain 0 must be allocated"
+        );
+        // Grain 1 and beyond: GTE == 0 (sparse).
+        let grain_sectors = GRAIN_SIZE_BYTES as u64 / 512;
+        assert!(
+            !reader.is_allocated(grain_sectors).expect("is_allocated lba=grain_sectors"),
+            "grain 1 must be sparse"
+        );
+    }
+
+    #[test]
+    fn lba_beyond_disk_is_not_allocated() {
+        let vmdk = test_sparse_vmdk(&[0u8; 512]);
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        let beyond = reader.sector_count() + 1;
+        assert!(
+            !reader.is_allocated(beyond).expect("is_allocated beyond end"),
+            "LBA beyond virtual disk must be not-allocated"
+        );
+    }
+
+    #[test]
+    fn iter_allocated_grains_yields_grain_zero() {
+        let vmdk = test_sparse_vmdk(&[0u8; 512]);
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        let grains = reader.iter_allocated_grains().expect("iter_allocated_grains");
+        assert_eq!(grains.len(), 1, "only grain 0 is allocated");
+        assert_eq!(grains[0].start_lba, 0);
+        assert_eq!(grains[0].sector_count, GRAIN_SIZE_BYTES as u64 / 512);
+    }
+
+    #[test]
+    fn iter_allocated_grains_all_sparse_returns_empty() {
+        let vmdk = gd_at_end_stream_opt_vmdk(); // all-sparse streamOptimized
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        let grains = reader.iter_allocated_grains().expect("iter_allocated_grains");
+        assert!(grains.is_empty(), "all-sparse VMDK must yield no allocated grains");
     }
 
     // ── VmdkInfo / metadata API ───────────────────────────────────────────────
