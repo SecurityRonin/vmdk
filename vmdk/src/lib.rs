@@ -306,7 +306,30 @@ impl<R: Read + Seek> VmdkReader<R> {
     /// For flat/raw-extent VMDKs every sector is implicitly allocated; returns `true` for
     /// any in-bounds LBA.
     pub fn is_allocated(&mut self, lba: u64) -> io::Result<bool> {
-        todo!("is_allocated not yet implemented")
+        if lba >= self.virtual_disk_size / SECTOR_SIZE {
+            return Ok(false);
+        }
+        // Extract all values from self.fmt before any mutable borrow of self.inner.
+        let virtual_offset = lba * SECTOR_SIZE;
+        let gt_sector_and_gte = match &self.fmt {
+            FormatState::Flat => return Ok(true),
+            FormatState::Sparse { grain_dir, grain_size_bytes, num_gtes_per_gt, .. } => {
+                let grain_idx = virtual_offset / grain_size_bytes;
+                let gd_idx = (grain_idx / num_gtes_per_gt) as usize;
+                let gte_idx = grain_idx % num_gtes_per_gt;
+                let gt_sector = grain_dir.get(gd_idx).copied().unwrap_or(0);
+                (gt_sector, gte_idx)
+            }
+        };
+        let (gt_sector, gte_idx) = gt_sector_and_gte;
+        if gt_sector == 0 {
+            return Ok(false);
+        }
+        let gte_file_pos = u64::from(gt_sector) * SECTOR_SIZE + gte_idx * 4;
+        self.inner.seek(SeekFrom::Start(gte_file_pos))?;
+        let mut gte_bytes = [0u8; 4];
+        self.inner.read_exact(&mut gte_bytes)?;
+        Ok(u32::from_le_bytes(gte_bytes) > 1)
     }
 
     /// Iterate over all allocated (non-sparse) grain ranges in LBA order.
@@ -315,7 +338,52 @@ impl<R: Read + Seek> VmdkReader<R> {
     /// grains are not coalesced so the caller can apply its own merging if desired.
     /// The iterator is eager — it collects all GTE reads upfront to avoid borrow issues.
     pub fn iter_allocated_grains(&mut self) -> io::Result<Vec<AllocatedGrain>> {
-        todo!("iter_allocated_grains not yet implemented")
+        let (grain_dir, grain_size_bytes, num_gtes_per_gt) = match &self.fmt {
+            FormatState::Flat => {
+                // All sectors allocated; yield the entire virtual disk as one grain.
+                let sector_count = self.virtual_disk_size / SECTOR_SIZE;
+                return Ok(if sector_count == 0 {
+                    vec![]
+                } else {
+                    vec![AllocatedGrain { start_lba: 0, sector_count }]
+                });
+            }
+            FormatState::Sparse {
+                grain_dir,
+                grain_size_bytes,
+                num_gtes_per_gt,
+                ..
+            } => (grain_dir.clone(), *grain_size_bytes, *num_gtes_per_gt),
+        };
+        let grain_sectors = grain_size_bytes / SECTOR_SIZE;
+        let mut result = Vec::new();
+
+        for (gd_idx, &gt_sector) in grain_dir.iter().enumerate() {
+            if gt_sector == 0 {
+                continue;
+            }
+            let gt_byte_offset = u64::from(gt_sector) * SECTOR_SIZE;
+            let gt_size = num_gtes_per_gt as usize * 4;
+            self.inner.seek(SeekFrom::Start(gt_byte_offset))?;
+            let mut gt_bytes = vec![0u8; gt_size];
+            self.inner.read_exact(&mut gt_bytes)?;
+
+            for gte_idx in 0..num_gtes_per_gt as usize {
+                let gte = u32::from_le_bytes(
+                    gt_bytes[gte_idx * 4..gte_idx * 4 + 4]
+                        .try_into()
+                        .expect("4 bytes"),
+                );
+                if gte > 1 {
+                    let grain_idx = gd_idx as u64 * num_gtes_per_gt + gte_idx as u64;
+                    let start_lba = grain_idx * grain_sectors;
+                    if start_lba < self.virtual_disk_size / SECTOR_SIZE {
+                        result.push(AllocatedGrain { start_lba, sector_count: grain_sectors });
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Resolve `virtual_offset` to a [`GrainLookup`] describing where to find the data.
