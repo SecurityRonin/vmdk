@@ -1007,6 +1007,47 @@ mod tests {
         }
     }
 
+    // ── VMFS flat / ZERO extent descriptor parsing ───────────────────────────
+
+    #[test]
+    fn vmfs_flat_extent_descriptor_opens_via_open_path() {
+        // A vmfs descriptor with VMFS extent type (not FLAT) must open.
+        // Currently returns Err(UnsupportedDiskType) because VMFS extent type is unrecognised.
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let raw_path = dir.path().join("disk.vmdk");
+        std::fs::File::create(&raw_path)
+            .unwrap()
+            .write_all(&vec![0u8; 512])
+            .unwrap();
+        let desc = format!(
+            "# Disk DescriptorFile\nversion=1\nCID=ffffffff\nparentCID=ffffffff\ncreateType=\"vmfs\"\nRW 1 VMFS \"{}\"\n",
+            raw_path.file_name().unwrap().to_string_lossy()
+        );
+        let desc_path = dir.path().join("disk_desc.vmdk");
+        std::fs::write(&desc_path, desc.as_bytes()).unwrap();
+        let result = VmdkFileReader::open_path(&desc_path);
+        assert!(result.is_ok(), "vmfs descriptor with VMFS extent must open, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn vmfssparse_extent_descriptor_opens_as_cowd() {
+        // vmfsSparse descriptor with VMFSSPARSE extent type referencing a COWD file.
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let cowd_bytes = testutil::test_cowd_vmdk(&[0u8; 512]);
+        let cowd_path = dir.path().join("disk-delta.vmdk");
+        std::fs::File::create(&cowd_path).unwrap().write_all(&cowd_bytes).unwrap();
+        let desc = format!(
+            "# Disk DescriptorFile\nversion=1\nCID=ffffffff\nparentCID=ffffffff\ncreateType=\"vmfsSparse\"\nRW 8 VMFSSPARSE \"{}\"\n",
+            cowd_path.file_name().unwrap().to_string_lossy()
+        );
+        let desc_path = dir.path().join("desc.vmdk");
+        std::fs::write(&desc_path, desc.as_bytes()).unwrap();
+        let result = VmdkFileReader::open_path(&desc_path);
+        assert!(result.is_ok(), "vmfsSparse/VMFSSPARSE descriptor must open, got: {:?}", result.err());
+    }
+
     // ── seSparse format (vSphere 6.5+ VMFS6) ─────────────────────────────────
 
     #[test]
