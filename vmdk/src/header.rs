@@ -16,6 +16,7 @@ pub const GD_AT_END: u64 = 0xffff_ffff_ffff_ffff;
 
 /// Parsed fields from the 512-byte `SparseExtentHeader`.
 pub struct SparseExtentHeader {
+    pub version: u32,           // 1 = monolithicSparse, 3 = streamOptimized
     pub capacity: u64,          // virtual disk size in sectors
     pub grain_size: u64,        // grain size in sectors
     pub descriptor_offset: u64, // in sectors
@@ -74,6 +75,7 @@ impl SparseExtentHeader {
         }
 
         Ok(SparseExtentHeader {
+            version,
             capacity,
             grain_size,
             descriptor_offset,

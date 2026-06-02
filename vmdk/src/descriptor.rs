@@ -5,6 +5,14 @@ use crate::error::{Result, VmdkError};
 /// Parsed text VMDK descriptor.
 pub(crate) struct TextDescriptor {
     pub create_type: Box<str>,
+    /// Content ID (hex field `CID=`); `0xffff_ffff` when absent.
+    pub cid: u32,
+    /// Parent content ID (hex field `parentCID=`); `0xffff_ffff` when absent or base image.
+    pub parent_cid: u32,
+    /// Hint filename for the parent VMDK (`parentFileNameHint=`); empty when absent.
+    pub parent_file_name: Box<str>,
+    /// Raw descriptor text (NUL bytes stripped; used by `VmdkReader::descriptor_text()`).
+    pub raw_text: Box<str>,
     /// FLAT extents (twoGbMaxExtentFlat, monolithicFlat).
     pub extents: Vec<ExtentEntry>,
     /// SPARSE extents (twoGbMaxExtentSparse) — each is a binary VMDK with its own GD/GT.
@@ -31,21 +39,42 @@ pub(crate) struct SparseEntry {
     pub filename: Box<str>,
 }
 
-/// Parse a VMDK text descriptor, collecting `createType`, FLAT extents, and SPARSE extents.
+/// Parse a VMDK text descriptor, collecting all metadata fields and extent entries.
 pub(crate) fn parse_text_descriptor(text: &str) -> Result<TextDescriptor> {
     let mut create_type = Box::from("");
+    let mut cid: u32 = 0xffff_ffff;
+    let mut parent_cid: u32 = 0xffff_ffff;
+    let mut parent_file_name = Box::from("");
     let mut extents = Vec::new();
     let mut sparse_extents = Vec::new();
     let mut capacity_sectors = 0u64;
     let mut sparse_capacity_sectors = 0u64;
 
-    for line in text.lines() {
+    // Strip NUL padding (embedded descriptors are zero-padded to a sector boundary).
+    let text_clean = {
+        let end = text.find('\0').unwrap_or(text.len());
+        &text[..end]
+    };
+
+    for line in text_clean.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
         if let Some(rest) = line.strip_prefix("createType=") {
             create_type = Box::from(rest.trim_matches('"'));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("CID=") {
+            cid = u32::from_str_radix(rest.trim(), 16).unwrap_or(0xffff_ffff);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("parentCID=") {
+            parent_cid = u32::from_str_radix(rest.trim(), 16).unwrap_or(0xffff_ffff);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("parentFileNameHint=") {
+            parent_file_name = Box::from(rest.trim().trim_matches('"'));
             continue;
         }
         if let Some(ext) = try_parse_flat_extent(line) {
@@ -65,6 +94,10 @@ pub(crate) fn parse_text_descriptor(text: &str) -> Result<TextDescriptor> {
 
     Ok(TextDescriptor {
         create_type,
+        cid,
+        parent_cid,
+        parent_file_name,
+        raw_text: Box::from(text_clean),
         extents,
         sparse_extents,
         capacity_sectors,

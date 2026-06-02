@@ -118,17 +118,27 @@ pub struct VmdkReader<R: Read + Seek> {
     virtual_disk_size: u64,
     disk_type: Box<str>,
     pos: u64,
+    version: u32,
+    cid: u32,
+    parent_cid: u32,
+    descriptor_text: Box<str>,
 }
 
 /// Maximum bytes read from an embedded descriptor (guards against crafted images).
 const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 
-fn read_descriptor_create_type<R: Read + Seek>(
+/// Read the embedded text descriptor from a binary VMDK and parse it.
+///
+/// Returns a `TextDescriptor` with all metadata fields populated.
+/// When no embedded descriptor is present (`descriptor_offset=0` or `descriptor_size=0`),
+/// returns a descriptor with empty `create_type` and sentinel values for CID fields.
+fn read_descriptor<R: Read + Seek>(
     reader: &mut R,
     hdr: &SparseExtentHeader,
-) -> io::Result<Box<str>> {
+) -> io::Result<descriptor::TextDescriptor> {
     if hdr.descriptor_offset == 0 || hdr.descriptor_size == 0 {
-        return Ok(Box::from(""));
+        return descriptor::parse_text_descriptor("")
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
     }
     let byte_offset = hdr
         .descriptor_offset
@@ -142,21 +152,13 @@ fn read_descriptor_create_type<R: Read + Seek>(
     reader.seek(SeekFrom::Start(byte_offset))?;
     let mut buf = vec![0u8; byte_len as usize];
     reader.read_exact(&mut buf)?;
-    Ok(Box::from(parse_create_type(&buf)))
-}
 
-fn parse_create_type(buf: &[u8]) -> &str {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let text = match std::str::from_utf8(&buf[..end]) {
-        Ok(s) => s,
-        Err(_) => return "",
-    };
-    for line in text.lines() {
-        if let Some(rest) = line.trim().strip_prefix("createType=") {
-            return rest.trim_matches('"');
-        }
-    }
-    ""
+    let text = std::str::from_utf8(&buf[..end])
+        .unwrap_or("")
+        .to_owned();
+    descriptor::parse_text_descriptor(&text)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
 impl<R: Read + Seek> VmdkReader<R> {
@@ -179,7 +181,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             .checked_mul(SECTOR_SIZE)
             .ok_or_else(|| VmdkError::InvalidGeometry("capacity overflow".into()))?;
 
-        let disk_type = read_descriptor_create_type(&mut reader, &hdr)?;
+        let desc = read_descriptor(&mut reader, &hdr)?;
 
         let num_grains = hdr
             .capacity
@@ -232,8 +234,12 @@ impl<R: Read + Seek> VmdkReader<R> {
                 compressed: hdr.compressed,
             },
             virtual_disk_size,
-            disk_type,
+            disk_type: desc.create_type,
             pos: 0,
+            version: hdr.version,
+            cid: desc.cid,
+            parent_cid: desc.parent_cid,
+            descriptor_text: desc.raw_text,
         })
     }
 
@@ -251,17 +257,36 @@ impl<R: Read + Seek> VmdkReader<R> {
 
     /// Virtual disk size in 512-byte sectors.
     pub fn sector_count(&self) -> u64 {
-        todo!("sector_count not yet implemented")
+        self.virtual_disk_size / SECTOR_SIZE
     }
 
     /// Raw embedded descriptor text; empty when no embedded descriptor is present.
     pub fn descriptor_text(&self) -> &str {
-        todo!("descriptor_text not yet implemented")
+        &self.descriptor_text
     }
 
     /// Structured snapshot of all metadata for this image.
     pub fn info(&self) -> VmdkInfo {
-        todo!("info not yet implemented")
+        let (grain_size_sectors, grain_size_bytes, compressed) = match &self.fmt {
+            FormatState::Sparse {
+                grain_size_bytes,
+                compressed,
+                ..
+            } => (*grain_size_bytes / SECTOR_SIZE, *grain_size_bytes, *compressed),
+            FormatState::Flat => (0, 0, false),
+        };
+        VmdkInfo {
+            disk_type: self.disk_type.to_string(),
+            version: self.version,
+            cid: self.cid,
+            parent_cid: self.parent_cid,
+            grain_size_sectors,
+            grain_size_bytes,
+            virtual_disk_size: self.virtual_disk_size,
+            sector_count: self.virtual_disk_size / SECTOR_SIZE,
+            compressed,
+            descriptor_text: self.descriptor_text.to_string(),
+        }
     }
 
     /// Resolve `virtual_offset` to a [`GrainLookup`] describing where to find the data.
@@ -388,6 +413,10 @@ impl VmdkFileReader {
                         virtual_disk_size,
                         disk_type: desc.create_type,
                         pos: 0,
+                        version: 0,
+                        cid: desc.cid,
+                        parent_cid: desc.parent_cid,
+                        descriptor_text: desc.raw_text,
                     })
                 }
                 "twoGbMaxExtentSparse" => {
@@ -402,6 +431,10 @@ impl VmdkFileReader {
                         virtual_disk_size,
                         disk_type: desc.create_type,
                         pos: 0,
+                        version: 0,
+                        cid: desc.cid,
+                        parent_cid: desc.parent_cid,
+                        descriptor_text: desc.raw_text,
                     })
                 }
                 _ => Err(VmdkError::UnsupportedDiskType(
@@ -424,6 +457,10 @@ impl<R: Read + Seek + Send + 'static> VmdkReader<R> {
             virtual_disk_size: self.virtual_disk_size,
             disk_type: self.disk_type,
             pos: self.pos,
+            version: self.version,
+            cid: self.cid,
+            parent_cid: self.parent_cid,
+            descriptor_text: self.descriptor_text,
         }
     }
 }
