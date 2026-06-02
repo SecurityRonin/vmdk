@@ -1,6 +1,6 @@
 //! Minimal valid sparse VMDK builder for use in tests and downstream crates.
 
-use super::header::{MAGIC, SECTOR_SIZE, VERSION};
+use super::header::{MAGIC, SECTOR_SIZE, VERSION, VERSION_STREAM_OPT};
 
 // Layout constants (all in sectors unless noted):
 const DESCRIPTOR_OFFSET: u64 = 1;
@@ -68,5 +68,81 @@ pub fn test_sparse_vmdk(sector_data: &[u8]) -> Vec<u8> {
     vmdk.extend_from_slice(&rgd);
     vmdk.extend_from_slice(&gt);
     vmdk.extend_from_slice(&grain);
+    vmdk
+}
+
+// ── streamOptimized GD_AT_END layout constants ────────────────────────────────
+// Sector 0       : primary header (gdOffset = u64::MAX sentinel)
+// Sectors 1–20   : descriptor (createType="streamOptimized")
+// Sectors 21–24  : GT (512 GTEs, all zero → all-sparse)
+// Sector  25      : GD (1 entry → GT sector 21)
+// Sector  26      : footer header (real gdOffset = 25)
+// Sector  27      : EOS marker (all zeros)
+// Total: 28 sectors = 14 336 bytes; 1 MiB virtual disk
+const GAE_CAPACITY: u64 = 2048; // 1 MiB in sectors
+const GAE_GRAIN_SIZE: u64 = 128; // 64 KiB grain
+const GAE_NUM_GTES: u32 = 512;
+const GAE_DESC_OFFSET: u64 = 1;
+const GAE_DESC_SIZE: u64 = 20;
+const GAE_GT_SECTOR: u64 = 21;
+const GAE_GD_SECTOR: u64 = 25; // GAE_GT_SECTOR + 4 GT sectors
+const GAE_TOTAL_SECTORS: u64 = 28;
+
+// Writes a streamOptimized `SparseExtentHeader` into `h`, varying only `gd_off`.
+fn write_stream_opt_hdr(h: &mut [u8; 512], gd_off: u64) {
+    h[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    h[4..8].copy_from_slice(&VERSION_STREAM_OPT.to_le_bytes());
+    h[8..12].copy_from_slice(&0u32.to_le_bytes()); // flags
+    h[12..20].copy_from_slice(&GAE_CAPACITY.to_le_bytes());
+    h[20..28].copy_from_slice(&GAE_GRAIN_SIZE.to_le_bytes());
+    h[28..36].copy_from_slice(&GAE_DESC_OFFSET.to_le_bytes());
+    h[36..44].copy_from_slice(&GAE_DESC_SIZE.to_le_bytes());
+    h[44..48].copy_from_slice(&GAE_NUM_GTES.to_le_bytes());
+    h[48..56].copy_from_slice(&0u64.to_le_bytes()); // rgdOffset = 0
+    h[56..64].copy_from_slice(&gd_off.to_le_bytes());
+    h[64..72].copy_from_slice(&GAE_GD_SECTOR.to_le_bytes()); // overHead
+    h[72] = 0; // uncleanShutdown
+    h[73] = b'\n';
+    h[74] = b' ';
+    h[75] = b'\r';
+    h[76] = b'\n';
+    h[77..79].copy_from_slice(&1u16.to_le_bytes()); // compressAlgorithm = 1
+}
+
+/// Build a streamOptimized VMDK where the primary header carries `GD_AT_END`
+/// (`gdOffset = u64::MAX`) and the real GD is referenced by the footer header
+/// pinned at `file_end − 1024`.
+///
+/// Virtual size is 1 MiB, all grains are sparse (reads return zeros).
+#[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
+pub fn gd_at_end_stream_opt_vmdk() -> Vec<u8> {
+    let total_bytes = GAE_TOTAL_SECTORS * SECTOR_SIZE;
+    let mut vmdk = vec![0u8; total_bytes as usize];
+
+    // Sector 0: primary header with GD_AT_END sentinel.
+    let mut hdr = [0u8; 512];
+    write_stream_opt_hdr(&mut hdr, u64::MAX);
+    vmdk[0..512].copy_from_slice(&hdr);
+
+    // Sectors 1–20: descriptor.
+    let desc = b"# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType=\"streamOptimized\"\n";
+    let desc_start = GAE_DESC_OFFSET as usize * SECTOR_SIZE as usize;
+    let copy_len = desc.len().min(GAE_DESC_SIZE as usize * SECTOR_SIZE as usize);
+    vmdk[desc_start..desc_start + copy_len].copy_from_slice(&desc[..copy_len]);
+
+    // Sectors 21–24: GT (all zeros → all-sparse; already zeroed).
+
+    // Sector 25: GD — single entry pointing to GT at sector 21.
+    let gd_start = GAE_GD_SECTOR as usize * SECTOR_SIZE as usize;
+    vmdk[gd_start..gd_start + 4].copy_from_slice(&(GAE_GT_SECTOR as u32).to_le_bytes());
+
+    // Sector 26: footer header with real gdOffset = 25.
+    let footer_start = (GAE_TOTAL_SECTORS - 2) as usize * SECTOR_SIZE as usize;
+    let mut footer = [0u8; 512];
+    write_stream_opt_hdr(&mut footer, GAE_GD_SECTOR);
+    vmdk[footer_start..footer_start + 512].copy_from_slice(&footer);
+
+    // Sector 27: EOS marker (already all zeros).
+
     vmdk
 }

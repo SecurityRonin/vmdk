@@ -443,7 +443,7 @@ mod testutil;
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use testutil::{test_sparse_vmdk, GRAIN_SIZE_BYTES};
+    use testutil::{gd_at_end_stream_opt_vmdk, test_sparse_vmdk, GRAIN_SIZE_BYTES};
 
     fn vmdk_header_bytes(capacity_sectors: u64, grain_size: u64, num_gtes_per_gt: u32) -> Vec<u8> {
         let mut h = vec![0u8; 512];
@@ -514,6 +514,25 @@ mod tests {
     fn vmdk_reader_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<VmdkReader<Cursor<Vec<u8>>>>();
+    }
+
+    #[test]
+    fn stream_opt_gd_at_end_opens_correctly() {
+        let vmdk = gd_at_end_stream_opt_vmdk();
+        let reader = VmdkReader::open(Cursor::new(vmdk))
+            .expect("streamOptimized GD_AT_END must open via footer lookup");
+        assert_eq!(reader.virtual_disk_size(), 1_048_576);
+        assert_eq!(reader.disk_type(), "streamOptimized");
+    }
+
+    #[test]
+    fn stream_opt_gd_at_end_reads_zeros() {
+        let vmdk = gd_at_end_stream_opt_vmdk();
+        let mut reader =
+            VmdkReader::open(Cursor::new(vmdk)).expect("open GD_AT_END vmdk");
+        let mut buf = [0xFFu8; 512];
+        reader.read_exact(&mut buf).expect("read sector 0");
+        assert_eq!(buf, [0u8; 512]);
     }
 
     proptest::proptest! {
