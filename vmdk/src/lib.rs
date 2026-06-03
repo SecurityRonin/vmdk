@@ -869,7 +869,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             };
         }
 
-        let (gt_sector, gte_idx, offset_in_grain, compressed, grain_size_bytes) = {
+        let (gt_sector, gte_idx, offset_in_grain, compressed, grain_size_bytes, num_gtes_per_gt) = {
             let FormatState::Sparse {
                 grain_dir,
                 grain_size_bytes,
@@ -890,6 +890,7 @@ impl<R: Read + Seek> VmdkReader<R> {
                 offset_in_grain,
                 *compressed,
                 *grain_size_bytes,
+                *num_gtes_per_gt,
             )
         };
         if gt_sector == 0 {
@@ -902,15 +903,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             // Read the full GT (num_gtes_per_gt entries × 4 bytes) into the cache.
             let gt_byte_offset = u64::from(gt_sector) * SECTOR_SIZE;
             self.inner.seek(SeekFrom::Start(gt_byte_offset))?;
-            let gt_size = {
-                let FormatState::Sparse {
-                    num_gtes_per_gt, ..
-                } = &self.fmt
-                else {
-                    unreachable!()
-                };
-                *num_gtes_per_gt as usize * 4
-            };
+            let gt_size = num_gtes_per_gt as usize * 4;
             let mut gt_bytes = vec![0u8; gt_size];
             self.inner.read_exact(&mut gt_bytes)?;
             let gt: Vec<u32> = gt_bytes
@@ -2539,6 +2532,55 @@ mod tests {
         v[gd..gd + 4].copy_from_slice(&(gt_sector as u32).to_le_bytes());
         // GD[1] stays 0. GT at sector 2 is all-zero → grain 0 sparse.
         v
+    }
+
+    /// Patch the seSparse grain directory entry (GD[0] at sector 2) to `gd`.
+    fn sesparse_with_gd0(gd: u64) -> Vec<u8> {
+        let mut se = test_sesparse_vmdk(&[0xABu8; 512]);
+        let off = 2 * 512; // GD_SECTOR in testutil layout
+        se[off..off + 8].copy_from_slice(&gd.to_le_bytes());
+        se
+    }
+
+    #[test]
+    fn sesparse_zero_gd_entry_is_fully_sparse() {
+        // GD[0] = 0 → grain table absent → every method takes the unallocated path.
+        let mut r = VmdkReader::open(Cursor::new(sesparse_with_gd0(0))).expect("open");
+        assert!(!r.is_allocated(0).expect("is_allocated")); // se_read_gte None
+        r.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = [0xFFu8; 512];
+        r.read_exact(&mut buf).unwrap(); // grain_location → Sparse
+        assert_eq!(buf, [0u8; 512]);
+        assert!(r.iter_allocated_grains().expect("iter").is_empty()); // GD-0 continue
+        let rep = r.check_integrity().expect("integrity"); // GD-0 continue
+        assert!(rep.is_ok());
+        assert_eq!(rep.grains_checked, 0);
+    }
+
+    #[test]
+    fn sesparse_integrity_flags_grain_table_past_eof() {
+        // Allocated GD marker but a grain-table index far past EOF.
+        let mut r =
+            VmdkReader::open(Cursor::new(sesparse_with_gd0(0x1000_0000_00ff_ffff))).expect("open");
+        let rep = r.check_integrity().expect("integrity");
+        assert!(!rep.is_ok());
+        assert_eq!(rep.out_of_bounds_grain_tables, 1);
+    }
+
+    #[test]
+    fn sesparse_descriptor_without_extent_errors() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let desc = "# Disk DescriptorFile\nversion=1\nCID=ffffffff\nparentCID=ffffffff\ncreateType=\"seSparse\"\n";
+        let p = dir.path().join("disk.vmdk");
+        std::fs::File::create(&p)
+            .unwrap()
+            .write_all(desc.as_bytes())
+            .unwrap();
+        assert!(matches!(
+            VmdkFileReader::open_path(&p),
+            Err(VmdkError::InvalidGeometry(_))
+        ));
     }
 
     #[test]

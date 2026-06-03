@@ -279,7 +279,9 @@ RW 2048 FLAT "flat-f001.vmdk" 0
     #[test]
     fn malformed_extent_lines_are_ignored() {
         // Lines that match neither flat nor sparse grammar are skipped, not errors.
-        let text = "createType=\"custom\"\nRW 100 BOGUS \"x.vmdk\"\nRDONLY notanumber FLAT \"y\"\n";
+        // "RW" alone exercises split_token's empty-remainder branch.
+        let text =
+            "createType=\"custom\"\nRW 100 BOGUS \"x.vmdk\"\nRDONLY notanumber FLAT \"y\"\nRW\n";
         let d = parse_text_descriptor(text).expect("parse");
         assert!(d.extents.is_empty());
         assert!(d.sparse_extents.is_empty());

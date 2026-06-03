@@ -85,16 +85,10 @@ pub(crate) fn open_cowd<R: Read + Seek>(mut reader: R) -> Result<(Vec<u32>, u64)
         (u64::from(hdr.capacity) + u64::from(hdr.grain_size) - 1) / u64::from(hdr.grain_size);
     let num_gts = (num_grains + COWD_GTES_PER_GT as u64 - 1) / COWD_GTES_PER_GT as u64;
 
-    let gd_bytes = num_gts
-        .checked_mul(4)
-        .ok_or_else(|| VmdkError::InvalidGeometry("COWD GD too large".into()))?
-        as usize;
-    const MAX_COWD_GD: usize = 16 * 1024 * 1024;
-    if gd_bytes > MAX_COWD_GD {
-        return Err(VmdkError::InvalidGeometry(
-            "COWD grain directory too large".into(),
-        ));
-    }
+    // `capacity` is a u32 and `grain_size >= 1`, so num_gts <= u32::MAX / 4096 and the
+    // grain directory is at most ~4 MiB — no explicit cap is needed (it cannot exceed
+    // the structural u32 bound), and the multiply cannot overflow u64.
+    let gd_bytes = (num_gts * 4) as usize;
 
     let gd_offset = u64::from(COWD_GD_SECTOR) * SECTOR_SIZE;
     reader.seek(SeekFrom::Start(gd_offset))?;

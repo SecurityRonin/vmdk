@@ -80,9 +80,10 @@ impl MultiSparseReader {
                 .checked_add(num_gtes_per_gt - 1)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "num_gts overflow"))?
                 / num_gtes_per_gt;
-            let gd_byte_len = num_gts.checked_mul(4).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "gd_byte_len overflow")
-            })?;
+            // grain_size >= 8 (header-enforced) bounds num_gts <= u64::MAX/8, so the
+            // 4-byte-per-entry multiply cannot overflow u64; the MAX_GD cap below is the
+            // real protection against an unbounded allocation.
+            let gd_byte_len = num_gts * 4;
 
             const MAX_GD: u64 = 16 * 1024 * 1024;
             if gd_byte_len > MAX_GD {

@@ -509,7 +509,6 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::path::Path;
 
     fn data(name: &str) -> std::path::PathBuf {
@@ -600,7 +599,7 @@ mod tests {
         b[28..36].copy_from_slice(&0u64.to_le_bytes());
         b[36..44].copy_from_slice(&0u64.to_le_bytes());
         let p = dir.path().join("nodesc.vmdk");
-        std::fs::File::create(&p).unwrap().write_all(&b).unwrap();
+        std::fs::write(&p, &b).unwrap();
         assert!(!is_success(print_descriptor(&p)));
     }
 
@@ -644,5 +643,71 @@ mod tests {
         let (base, delta) = vmdk::testutil::write_chain_to_dir(dir.path(), &[0u8; 512]);
         assert!(is_success(print_chain(&base)));
         assert!(is_success(print_chain(&delta)));
+    }
+
+    /// A sparse VMDK that opens (header + GD are in bounds) but whose grain table
+    /// and RGD point past EOF, so iter_allocated_grains and validate_rgd fail.
+    fn opens_but_gt_and_rgd_dangle() -> Vec<u8> {
+        let mut v = vec![0u8; 1024]; // header (sector 0) + GD (sector 1)
+        v[0..4].copy_from_slice(&0x564D_444Bu32.to_le_bytes());
+        v[4..8].copy_from_slice(&1u32.to_le_bytes());
+        v[12..20].copy_from_slice(&8u64.to_le_bytes()); // capacity 8 sectors
+        v[20..28].copy_from_slice(&8u64.to_le_bytes()); // grain_size 8
+        v[44..48].copy_from_slice(&512u32.to_le_bytes()); // num_gtes_per_gt
+        v[48..56].copy_from_slice(&9999u64.to_le_bytes()); // rgd_offset past EOF
+        v[56..64].copy_from_slice(&1u64.to_le_bytes()); // gd_offset = sector 1
+                                                        // GD[0] points to a grain table sector far past EOF.
+        v[512..516].copy_from_slice(&9999u32.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn map_and_verify_fail_when_metadata_dangles() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dangling.vmdk");
+        std::fs::write(&p, opens_but_gt_and_rgd_dangle()).unwrap();
+        // open succeeds, but the GT read fails → map errors.
+        assert!(!is_success(cmd_map(&p)), "dangling GT → map error");
+        // validate_rgd + allocation scan both error → verify fails.
+        assert!(
+            !is_success(cmd_verify(&p)),
+            "dangling RGD/GT → verify error"
+        );
+    }
+
+    #[test]
+    fn diff_second_open_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let garbage = dir.path().join("g.bin");
+        std::fs::write(&garbage, b"nope").unwrap();
+        // First opens, second fails → exercises the second-open error arm.
+        assert!(!is_success(cmd_diff(&data("minimal.vmdk"), &garbage)));
+    }
+
+    #[test]
+    fn copy_n_and_dump_hex_stop_at_short_read() {
+        // A reader shorter than the requested count → early break (read returns 0).
+        let mut src = std::io::Cursor::new(vec![1u8, 2, 3, 4]);
+        let mut sink: Vec<u8> = Vec::new();
+        copy_n(&mut src, &mut sink, 10).expect("copy_n");
+        assert_eq!(sink, vec![1, 2, 3, 4]);
+
+        let mut src2 = std::io::Cursor::new(vec![9u8, 8, 7]);
+        dump_hex(&mut src2, 0, 10).expect("dump_hex stops at short read");
+    }
+
+    #[test]
+    fn copy_n_propagates_writer_error() {
+        struct FailWriter;
+        impl std::io::Write for FailWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("boom"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut src = std::io::Cursor::new(vec![0u8; 16]);
+        assert!(copy_n(&mut src, &mut FailWriter, 16).is_err());
     }
 }
