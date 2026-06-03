@@ -214,3 +214,88 @@ impl Seek for MultiSparseReader {
         Ok(self.pos)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor::SparseEntry;
+    use std::io::Write as _;
+
+    /// A minimal all-sparse VMDK4 extent: header + a zeroed grain directory.
+    fn all_sparse_extent() -> Vec<u8> {
+        let mut v = vec![0u8; 1024];
+        v[0..4].copy_from_slice(&0x564D_444Bu32.to_le_bytes()); // KDMV
+        v[4..8].copy_from_slice(&1u32.to_le_bytes()); // version 1
+        v[12..20].copy_from_slice(&8u64.to_le_bytes()); // capacity = 8 sectors
+        v[20..28].copy_from_slice(&8u64.to_le_bytes()); // grain_size = 8
+        v[44..48].copy_from_slice(&512u32.to_le_bytes()); // num_gtes_per_gt
+        v[56..64].copy_from_slice(&1u64.to_le_bytes()); // gd_offset = sector 1
+                                                        // GD at sector 1 stays all-zero → grain directory entry 0 (sparse).
+        v
+    }
+
+    fn open_one(dir: &std::path::Path, bytes: &[u8], sectors: u64) -> MultiSparseReader {
+        std::fs::File::create(dir.join("s001.vmdk"))
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        let e = SparseEntry {
+            size_sectors: sectors,
+            filename: Box::from("s001.vmdk"),
+        };
+        MultiSparseReader::open(dir, &[e]).unwrap()
+    }
+
+    #[test]
+    fn all_sparse_reads_zeros_and_seeks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = open_one(dir.path(), &all_sparse_extent(), 8);
+        // Read through the sparse grain → zeros (covers gt_sector==0 fill path).
+        let mut b = [0xFFu8; 512];
+        r.read_exact(&mut b).unwrap();
+        assert_eq!(b, [0u8; 512]);
+        // Seek variants.
+        assert_eq!(r.seek(SeekFrom::Start(1024)).unwrap(), 1024);
+        assert_eq!(r.seek(SeekFrom::Current(-512)).unwrap(), 512);
+        assert_eq!(r.seek(SeekFrom::End(-256)).unwrap(), 8 * 512 - 256);
+        // Read at end → 0; empty buffer → 0.
+        r.seek(SeekFrom::Start(8 * 512)).unwrap();
+        assert_eq!(r.read(&mut [0u8; 4]).unwrap(), 0);
+        r.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(r.read(&mut []).unwrap(), 0);
+    }
+
+    #[test]
+    fn seek_before_start_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = open_one(dir.path(), &all_sparse_extent(), 8);
+        assert!(r.seek(SeekFrom::End(-99999)).is_err());
+    }
+
+    #[test]
+    fn grain_directory_too_large_rejected() {
+        // capacity huge + grain_size 8 → GD exceeds the 16 MiB cap.
+        let mut v = all_sparse_extent();
+        v[12..20].copy_from_slice(&100_000_000_000u64.to_le_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(dir.path().join("s001.vmdk"))
+            .unwrap()
+            .write_all(&v)
+            .unwrap();
+        let e = SparseEntry {
+            size_sectors: 8,
+            filename: Box::from("s001.vmdk"),
+        };
+        assert!(MultiSparseReader::open(dir.path(), &[e]).is_err());
+    }
+
+    #[test]
+    fn missing_extent_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = SparseEntry {
+            size_sectors: 8,
+            filename: Box::from("absent.vmdk"),
+        };
+        assert!(MultiSparseReader::open(dir.path(), &[e]).is_err());
+    }
+}

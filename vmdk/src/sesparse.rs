@@ -205,4 +205,32 @@ mod tests {
             Err(VmdkError::InvalidGeometry(_))
         ));
     }
+
+    #[test]
+    fn sesparse_short_buffer_rejected() {
+        assert!(matches!(
+            SeConstHeader::parse(&[0u8; 100]),
+            Err(VmdkError::FileTooSmall)
+        ));
+    }
+
+    #[test]
+    fn sesparse_wrong_grain_table_size_rejected() {
+        let mut h = make_sesparse_header(8);
+        h[32..40].copy_from_slice(&128u64.to_le_bytes()); // grain_table_size=128, not 64
+        assert!(matches!(
+            SeConstHeader::parse(&h),
+            Err(VmdkError::InvalidGeometry(_))
+        ));
+    }
+
+    #[test]
+    fn sesparse_grain_directory_too_large_rejected() {
+        // A capacity large enough that the GD would exceed the 16 MiB cap.
+        let h = make_sesparse_header(100_000_000_000);
+        assert!(matches!(
+            open_sesparse(std::io::Cursor::new(h)),
+            Err(VmdkError::InvalidGeometry(_))
+        ));
+    }
 }

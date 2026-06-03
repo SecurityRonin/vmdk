@@ -102,3 +102,82 @@ impl Seek for MultiExtentReader {
         Ok(self.pos)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor::ExtentEntry;
+    use std::io::Write as _;
+
+    fn two_sector_reader(dir: &std::path::Path) -> MultiExtentReader {
+        std::fs::File::create(dir.join("e.vmdk"))
+            .unwrap()
+            .write_all(&[7u8; 1024])
+            .unwrap();
+        let ext = ExtentEntry {
+            size_sectors: 2,
+            filename: Box::from("e.vmdk"),
+            file_byte_offset: 0,
+            is_zero: false,
+        };
+        MultiExtentReader::open(dir, &[ext]).unwrap()
+    }
+
+    #[test]
+    fn seek_current_end_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = two_sector_reader(dir.path());
+        assert_eq!(r.seek(SeekFrom::Start(512)).unwrap(), 512);
+        assert_eq!(r.seek(SeekFrom::Current(-256)).unwrap(), 256);
+        assert_eq!(r.seek(SeekFrom::End(-100)).unwrap(), 1024 - 100);
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b).unwrap();
+        assert_eq!(b, [7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn seek_before_start_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = two_sector_reader(dir.path());
+        assert!(r.seek(SeekFrom::End(-99999)).is_err());
+    }
+
+    #[test]
+    fn read_past_end_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = two_sector_reader(dir.path());
+        r.seek(SeekFrom::Start(1024)).unwrap();
+        let mut b = [0u8; 4];
+        assert_eq!(r.read(&mut b).unwrap(), 0);
+        // empty buffer also yields 0
+        r.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(r.read(&mut []).unwrap(), 0);
+    }
+
+    #[test]
+    fn missing_extent_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = ExtentEntry {
+            size_sectors: 2,
+            filename: Box::from("nope.vmdk"),
+            file_byte_offset: 0,
+            is_zero: false,
+        };
+        assert!(MultiExtentReader::open(dir.path(), &[ext]).is_err());
+    }
+
+    #[test]
+    fn zero_extent_reads_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = ExtentEntry {
+            size_sectors: 2,
+            filename: Box::from(""),
+            file_byte_offset: 0,
+            is_zero: true,
+        };
+        let mut r = MultiExtentReader::open(dir.path(), &[ext]).unwrap();
+        let mut b = [0xFFu8; 8];
+        r.read_exact(&mut b).unwrap();
+        assert_eq!(b, [0u8; 8]);
+    }
+}

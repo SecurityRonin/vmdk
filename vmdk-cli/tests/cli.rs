@@ -408,3 +408,138 @@ fn diff_different_vmdks_exits_nonzero() {
         "diff of different VMDKs (different sizes) must exit non-zero"
     );
 }
+
+// ── e2e coverage: per-command error / output branches ────────────────────────
+
+fn write_tmp(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
+    let p = dir.path().join(name);
+    std::fs::write(&p, bytes).expect("write fixture");
+    p.to_string_lossy().into_owned()
+}
+
+#[test]
+fn info_shows_parent_cid_for_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let desc = "# Disk DescriptorFile\nversion=1\nCID=00000002\nparentCID=00000001\nparentFileNameHint=\"base.vmdk\"\ncreateType=\"monolithicSparse\"\n";
+    let bytes = vmdk::testutil::test_sparse_vmdk_with_descriptor(&[0u8; 512], desc);
+    let p = write_tmp(&dir, "delta.vmdk", &bytes);
+    let out = vmdk_bin().args(["info", &p]).output().unwrap();
+    assert!(out.status.success(), "exit: {}", out.status);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("Parent CID"),
+        "delta must show Parent CID, got: {s}"
+    );
+}
+
+#[test]
+fn info_descriptor_errors_when_absent() {
+    // A binary VMDK with descriptor_offset/size = 0 has no embedded descriptor.
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = vmdk::testutil::test_sparse_vmdk(&[0u8; 512]);
+    bytes[28..36].copy_from_slice(&0u64.to_le_bytes()); // descriptor_offset = 0
+    bytes[36..44].copy_from_slice(&0u64.to_le_bytes()); // descriptor_size = 0
+    let p = write_tmp(&dir, "nodesc.vmdk", &bytes);
+    let out = vmdk_bin()
+        .args(["info", "--descriptor", &p])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "no-descriptor image must error on --descriptor"
+    );
+}
+
+#[test]
+fn info_chain_falls_back_on_missing_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let desc = "# Disk DescriptorFile\nversion=1\nCID=00000002\nparentCID=00000001\nparentFileNameHint=\"missing-base.vmdk\"\ncreateType=\"monolithicSparse\"\n";
+    let bytes = vmdk::testutil::test_sparse_vmdk_with_descriptor(&[0u8; 512], desc);
+    let p = write_tmp(&dir, "delta.vmdk", &bytes);
+    let out = vmdk_bin().args(["info", "--chain", &p]).output().unwrap();
+    assert!(out.status.success(), "exit: {}", out.status);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("Parent CID") || s.contains("parent file not found"),
+        "missing-parent chain must report the dangling parent, got: {s}"
+    );
+}
+
+#[test]
+fn commands_error_on_non_vmdk_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_tmp(&dir, "garbage.bin", b"not a vmdk at all, just bytes");
+    for cmd in [["info"], ["map"], ["verify"], ["hash"]] {
+        let out = vmdk_bin().args([cmd[0], &p]).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "{} on garbage must exit non-zero",
+            cmd[0]
+        );
+    }
+}
+
+#[test]
+fn dump_output_to_unwritable_path_errors() {
+    let p = data_path("minimal.vmdk");
+    let out = vmdk_bin()
+        .args(["dump", "-o", "/no_such_dir_xyz/out.raw", &p])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "dump to an uncreatable path must error"
+    );
+}
+
+#[test]
+fn dump_hex_partial_line_and_nonprintable() {
+    // Length 20 → one full 16-byte row + a 4-byte partial row (exercises padding);
+    // dfvfs offset 1024 contains a mix of printable and non-printable bytes.
+    let out = vmdk_bin()
+        .args([
+            "dump",
+            "--hex",
+            "--offset",
+            "1024",
+            "--length",
+            "20",
+            &data_path("dfvfs_ext2.vmdk"),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "exit: {}", out.status);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("00000400"), "offset column present");
+    assert!(
+        s.lines().count() >= 2,
+        "partial second row must render, got: {s}"
+    );
+}
+
+#[test]
+fn verify_reports_rgd_ok_for_image_with_matching_rgd() {
+    // test_sparse_vmdk writes a redundant grain directory identical to the primary.
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = vmdk::testutil::test_sparse_vmdk(&[0u8; 512]);
+    let p = write_tmp(&dir, "withrgd.vmdk", &bytes);
+    let out = vmdk_bin().args(["verify", &p]).output().unwrap();
+    assert!(out.status.success(), "exit: {}", out.status);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("RGD:     OK"), "must report RGD OK, got: {s}");
+}
+
+#[test]
+fn diff_same_size_different_content_reports_differences() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a_data = vec![0u8; 512];
+    a_data[0] = 0xAA;
+    let mut b_data = vec![0u8; 512];
+    b_data[0] = 0xBB;
+    let a = write_tmp(&dir, "a.vmdk", &vmdk::testutil::test_sparse_vmdk(&a_data));
+    let b = write_tmp(&dir, "b.vmdk", &vmdk::testutil::test_sparse_vmdk(&b_data));
+    let out = vmdk_bin().args(["diff", &a, &b]).output().unwrap();
+    assert!(!out.status.success(), "differing images must exit non-zero");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("DIFFER"), "must report DIFFER, got: {s}");
+}

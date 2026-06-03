@@ -151,6 +151,14 @@ mod tests {
     }
 
     #[test]
+    fn cowd_header_short_buffer_rejected() {
+        assert!(matches!(
+            CowdHeader::parse(&[0u8; 16]),
+            Err(VmdkError::FileTooSmall)
+        ));
+    }
+
+    #[test]
     fn cowd_header_wrong_version_rejected() {
         let mut h = make_cowd_header(1024, 8, 1);
         h[4..8].copy_from_slice(&2u32.to_le_bytes()); // version=2

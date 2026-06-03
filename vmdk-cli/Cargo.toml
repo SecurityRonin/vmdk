@@ -16,6 +16,9 @@ clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# test-helpers exposes vmdk::testutil so e2e tests can synthesise fixtures
+# (deltas, matching-RGD images, differing-content pairs) for full CLI coverage.
+vmdk = { version = "0.2.0", path = "../vmdk", features = ["test-helpers"] }
 
 [lints]
 workspace = true

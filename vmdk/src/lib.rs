@@ -2321,4 +2321,83 @@ mod tests {
             );
         }
     }
+
+    // ── Coverage: seSparse method branches (is_allocated / iter / integrity) ──
+
+    #[test]
+    fn sesparse_is_allocated_iter_and_integrity() {
+        let mut data = vec![0u8; 512];
+        data[0] = 0x9A;
+        let se = test_sesparse_vmdk(&data);
+        let mut r = VmdkReader::open(Cursor::new(se)).expect("open");
+        assert!(r.is_allocated(0).expect("grain 0 allocated"));
+        assert!(!r
+            .is_allocated(10_000)
+            .expect("out-of-bounds lba is unallocated"));
+        let grains = r.iter_allocated_grains().expect("iter");
+        assert_eq!(grains.len(), 1);
+        assert_eq!(grains[0].start_lba, 0);
+        let rep = r.check_integrity().expect("integrity");
+        assert!(rep.is_ok());
+        assert_eq!(rep.grains_checked, 1);
+    }
+
+    #[test]
+    fn sesparse_invalid_gd_marker_errors_on_is_allocated() {
+        // Corrupt GD[0] (sector 2) so its allocated nibble is wrong → se_read_gte errors.
+        let mut se = test_sesparse_vmdk(&[0u8; 512]);
+        let gd = 2 * 512;
+        se[gd..gd + 8].copy_from_slice(&0x5000_0000_0000_0000u64.to_le_bytes());
+        let mut r = VmdkReader::open(Cursor::new(se)).expect("open");
+        let err = r.is_allocated(0).expect_err("invalid GD marker must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sesparse_invalid_gd_marker_skipped_in_iter_and_flagged_in_integrity() {
+        let mut se = test_sesparse_vmdk(&[0u8; 512]);
+        let gd = 2 * 512;
+        se[gd..gd + 8].copy_from_slice(&0x5000_0000_0000_0000u64.to_le_bytes());
+        let mut r = VmdkReader::open(Cursor::new(se)).expect("open");
+        assert!(r.iter_allocated_grains().expect("iter").is_empty());
+        let rep = r.check_integrity().expect("integrity");
+        assert_eq!(rep.out_of_bounds_grain_tables, 1);
+        assert!(!rep.is_ok());
+    }
+
+    // ── Coverage: Flat reader is_allocated / iter_allocated_grains ────────────
+
+    fn open_flat_descriptor(dir: &std::path::Path, data: &[u8]) -> VmdkFileReader {
+        use std::io::Write as _;
+        let sectors = data.len().div_ceil(512).max(1);
+        let mut ext = vec![0u8; sectors * 512];
+        ext[..data.len()].copy_from_slice(data);
+        std::fs::File::create(dir.join("disk-f001.vmdk"))
+            .unwrap()
+            .write_all(&ext)
+            .unwrap();
+        let desc = format!(
+            "# Disk DescriptorFile\nversion=1\nCID=ffffffff\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\nRW {sectors} FLAT \"disk-f001.vmdk\" 0\n"
+        );
+        let desc_path = dir.join("disk.vmdk");
+        std::fs::write(&desc_path, desc.as_bytes()).unwrap();
+        VmdkFileReader::open_path(&desc_path).expect("open flat")
+    }
+
+    #[test]
+    fn flat_is_allocated_and_iter_and_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = open_flat_descriptor(dir.path(), &[1u8; 1024]);
+        // Every in-bounds sector of a flat extent is allocated.
+        assert!(r.is_allocated(0).expect("flat lba 0 allocated"));
+        assert!(r.is_allocated(1).expect("flat lba 1 allocated"));
+        assert!(!r.is_allocated(10_000).expect("oob unallocated"));
+        // iter yields the whole disk as one range.
+        let grains = r.iter_allocated_grains().expect("iter");
+        assert_eq!(grains.len(), 1);
+        assert_eq!(grains[0].start_lba, 0);
+        assert_eq!(grains[0].sector_count, 2);
+        // Flat has no grain metadata → integrity trivially clean.
+        assert!(r.check_integrity().expect("integrity").is_ok());
+    }
 }

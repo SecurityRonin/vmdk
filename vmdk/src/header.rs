@@ -93,3 +93,83 @@ impl SparseExtentHeader {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_header() -> Vec<u8> {
+        let mut h = vec![0u8; 512];
+        h[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        h[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        h[12..20].copy_from_slice(&8u64.to_le_bytes()); // capacity
+        h[20..28].copy_from_slice(&8u64.to_le_bytes()); // grain_size
+        h[44..48].copy_from_slice(&512u32.to_le_bytes()); // num_gtes_per_gt
+        h
+    }
+
+    #[test]
+    fn parse_rejects_short_buffer() {
+        assert!(matches!(
+            SparseExtentHeader::parse(&[0u8; 100]),
+            Err(VmdkError::FileTooSmall)
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_bad_magic() {
+        let h = vec![0u8; 512];
+        assert!(matches!(
+            SparseExtentHeader::parse(&h),
+            Err(VmdkError::BadMagic)
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_version() {
+        let mut h = valid_header();
+        h[4..8].copy_from_slice(&4u32.to_le_bytes()); // version 4 is undefined
+        assert!(matches!(
+            SparseExtentHeader::parse(&h),
+            Err(VmdkError::UnsupportedVersion(4))
+        ));
+    }
+
+    #[test]
+    fn parse_accepts_version_2() {
+        let mut h = valid_header();
+        h[4..8].copy_from_slice(&VERSION_ZEROED_GRAIN.to_le_bytes());
+        let hdr = SparseExtentHeader::parse(&h).expect("v2 parses");
+        assert_eq!(hdr.version, 2);
+    }
+
+    #[test]
+    fn parse_rejects_grain_size_below_minimum() {
+        let mut h = valid_header();
+        h[20..28].copy_from_slice(&4u64.to_le_bytes()); // < 8
+        assert!(matches!(
+            SparseExtentHeader::parse(&h),
+            Err(VmdkError::InvalidGeometry(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_zero_num_gtes() {
+        let mut h = valid_header();
+        h[44..48].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            SparseExtentHeader::parse(&h),
+            Err(VmdkError::InvalidGeometry(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_compressed_flag_on_v1() {
+        let mut h = valid_header();
+        h[77..79].copy_from_slice(&1u16.to_le_bytes()); // compress on v1 is invalid
+        assert!(matches!(
+            SparseExtentHeader::parse(&h),
+            Err(VmdkError::CompressedNotSupported)
+        ));
+    }
+}

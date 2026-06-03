@@ -258,4 +258,55 @@ RW 2048 FLAT "flat-f001.vmdk" 0
         let d = parse_text_descriptor(text).expect("parse");
         assert_eq!(d.extents[0].file_byte_offset, 4096 * 512);
     }
+
+    #[test]
+    fn parse_flat_bare_word_filename() {
+        // Unquoted (bare-word) filename — exercises the non-quoted branch.
+        let text = "createType=\"monolithicFlat\"\nRW 2048 FLAT bare-f001.vmdk 0\n";
+        let d = parse_text_descriptor(text).expect("parse");
+        assert_eq!(d.extents.len(), 1);
+        assert_eq!(d.extents[0].filename.as_ref(), "bare-f001.vmdk");
+    }
+
+    #[test]
+    fn parse_sparse_bare_word_filename() {
+        let text = "createType=\"twoGbMaxExtentSparse\"\nRW 2048 SPARSE bare-s001.vmdk\n";
+        let d = parse_text_descriptor(text).expect("parse");
+        assert_eq!(d.sparse_extents.len(), 1);
+        assert_eq!(d.sparse_extents[0].filename.as_ref(), "bare-s001.vmdk");
+    }
+
+    #[test]
+    fn malformed_extent_lines_are_ignored() {
+        // Lines that match neither flat nor sparse grammar are skipped, not errors.
+        let text = "createType=\"custom\"\nRW 100 BOGUS \"x.vmdk\"\nRDONLY notanumber FLAT \"y\"\n";
+        let d = parse_text_descriptor(text).expect("parse");
+        assert!(d.extents.is_empty());
+        assert!(d.sparse_extents.is_empty());
+    }
+
+    #[test]
+    fn sparse_extent_capacity_overflow_is_rejected() {
+        // Two near-u64::MAX SPARSE extents overflow the running capacity sum.
+        let big = u64::MAX;
+        let text = format!(
+            "createType=\"twoGbMaxExtentSparse\"\nRW {big} SPARSE \"a\"\nRW {big} SPARSE \"b\"\n"
+        );
+        assert!(matches!(
+            parse_text_descriptor(&text),
+            Err(VmdkError::InvalidGeometry(_))
+        ));
+    }
+
+    #[test]
+    fn flat_extent_capacity_overflow_is_rejected() {
+        let big = u64::MAX;
+        let text = format!(
+            "createType=\"twoGbMaxExtentFlat\"\nRW {big} FLAT \"a\" 0\nRW {big} FLAT \"b\" 0\n"
+        );
+        assert!(matches!(
+            parse_text_descriptor(&text),
+            Err(VmdkError::InvalidGeometry(_))
+        ));
+    }
 }
