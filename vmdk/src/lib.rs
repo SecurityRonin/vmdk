@@ -523,6 +523,35 @@ impl<R: Read + Seek> VmdkReader<R> {
         DiskDatabase::parse(&self.descriptor_text)
     }
 
+    /// The descriptor's `changeTrackPath` — the Change Block Tracking (`-ctk.vmdk`)
+    /// file, if this disk has CBT enabled. The `-ctk` file maps which blocks changed
+    /// between snapshots and is the basis for incremental forensic acquisition.
+    pub fn change_track_path(&self) -> Option<String> {
+        for line in self.descriptor_text.lines() {
+            if let Some(rest) = line.trim().strip_prefix("changeTrackPath") {
+                let v = rest.trim_start().trim_start_matches('=').trim();
+                let v = v.trim_matches('"');
+                if !v.is_empty() {
+                    return Some(v.to_owned());
+                }
+            }
+        }
+        None
+    }
+
+    /// The disk's effective content identifier as a hex string.
+    ///
+    /// When `CID == 0xFFFFFFFE` (the "use the long content identifier" sentinel),
+    /// returns `ddb.longContentID`; otherwise the 8-hex-digit short CID.
+    pub fn effective_content_id(&self) -> String {
+        if self.cid == 0xffff_fffe {
+            if let Some(long) = self.disk_database().long_content_id {
+                return long;
+            }
+        }
+        format!("{:08x}", self.cid)
+    }
+
     /// Read the VMDK4 (KDMV) sparse extent header's provenance/integrity signals
     /// (`uncleanShutdown`, the newline-detection bytes, and the flag bits).
     ///
