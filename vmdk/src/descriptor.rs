@@ -277,6 +277,25 @@ RW 2048 FLAT "flat-f001.vmdk" 0
     }
 
     #[test]
+    fn parse_vmfsrdm_raw_device_mapping_extent() {
+        // A Raw Device Mapping (RDM) disk points a VMFSRDM extent at the mapped
+        // physical LUN (here a `vml.*` device identifier). libvmdk recognises
+        // VMFSRDM as a first-class extent type; dropping it loses the record of
+        // which physical device the VM had passthrough access to.
+        let text = "createType=\"vmfsRawDeviceMap\"\nRW 20971520 VMFSRDM \"vml.02000000006006016015301d00\"\n";
+        let d = parse_text_descriptor(text).expect("parse");
+        assert_eq!(d.create_type.as_ref(), "vmfsRawDeviceMap");
+        assert_eq!(d.extents.len(), 1);
+        assert_eq!(
+            d.extents[0].filename.as_ref(),
+            "vml.02000000006006016015301d00"
+        );
+        assert_eq!(d.extents[0].size_sectors, 20_971_520);
+        assert!(!d.extents[0].is_zero);
+        assert_eq!(d.capacity_sectors, 20_971_520);
+    }
+
+    #[test]
     fn malformed_extent_lines_are_ignored() {
         // Lines that match neither flat nor sparse grammar are skipped, not errors.
         // "RW" alone exercises split_token's empty-remainder branch.
