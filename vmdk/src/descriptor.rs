@@ -124,9 +124,10 @@ fn try_parse_flat_extent(line: &str) -> Option<ExtentEntry> {
     let size_sectors: u64 = sectors_str.parse().ok()?;
     rest = tail;
 
-    // Extent type — FLAT/VMFS are file-backed; ZERO has no file.
+    // Extent type — FLAT/VMFS/VMFSRAW are file-backed (VMFSRAW maps a raw LUN);
+    // ZERO has no file.
     let (ext_type, tail) = split_token(rest)?;
-    if !matches!(ext_type, "FLAT" | "VMFS" | "ZERO") {
+    if !matches!(ext_type, "FLAT" | "VMFS" | "VMFSRAW" | "ZERO") {
         return None;
     }
     rest = tail.trim_start();

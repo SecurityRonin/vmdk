@@ -889,11 +889,18 @@ impl VmdkFileReader {
             let dir = path.parent().unwrap_or(Path::new("."));
 
             match desc.create_type.as_ref() {
-                // ESXi flat formats (preallocated): FLAT/VMFS extent type — raw bytes.
+                // Flat / device-passthrough formats — FLAT/VMFS/VMFSRAW/ZERO extents read
+                // as raw bytes. Device maps (fullDevice/partitionedDevice/vmfsRaw/RDM)
+                // reference a device path; present paths read, absent ones yield NotFound.
                 "vmfs"
                 | "vmfsPreallocated"
                 | "vmfsEagerZeroedThick"
                 | "vmfsRDM"
+                | "vmfsRaw"
+                | "vmfsRawDeviceMap"
+                | "vmfsPassthroughRawDeviceMap"
+                | "fullDevice"
+                | "partitionedDevice"
                 | "twoGbMaxExtentFlat"
                 | "monolithicFlat" => {
                     let multi = MultiExtentReader::open(dir, &desc.extents)?;
@@ -950,6 +957,58 @@ impl VmdkFileReader {
                     let extent_path = dir.join(entry.filename.as_ref());
                     let file = BufReader::new(File::open(&extent_path)?);
                     Ok(VmdkReader::open(file)?.into_file_reader())
+                }
+                // custom: an arbitrary extent mix — route by which extents are present.
+                "custom" => {
+                    if !desc.extents.is_empty() {
+                        let multi = MultiExtentReader::open(dir, &desc.extents)?;
+                        let virtual_disk_size = desc
+                            .capacity_sectors
+                            .checked_mul(SECTOR_SIZE)
+                            .ok_or_else(|| {
+                                VmdkError::InvalidGeometry("capacity overflow".into())
+                            })?;
+                        Ok(VmdkReader {
+                            inner: Box::new(multi) as Box<dyn ReadSeek + Send>,
+                            fmt: FormatState::Flat,
+                            virtual_disk_size,
+                            disk_type: desc.create_type,
+                            pos: 0,
+                            version: 0,
+                            cid: desc.cid,
+                            parent_cid: desc.parent_cid,
+                            descriptor_text: desc.raw_text,
+                            rgd_offset: 0,
+                            gd_entry_count: 0,
+                            gt_cache: HashMap::new(),
+                        })
+                    } else if !desc.sparse_extents.is_empty() {
+                        let multi = MultiSparseReader::open(dir, &desc.sparse_extents)?;
+                        let virtual_disk_size = desc
+                            .sparse_capacity_sectors
+                            .checked_mul(SECTOR_SIZE)
+                            .ok_or_else(|| {
+                                VmdkError::InvalidGeometry("capacity overflow".into())
+                            })?;
+                        Ok(VmdkReader {
+                            inner: Box::new(multi) as Box<dyn ReadSeek + Send>,
+                            fmt: FormatState::Flat,
+                            virtual_disk_size,
+                            disk_type: desc.create_type,
+                            pos: 0,
+                            version: 0,
+                            cid: desc.cid,
+                            parent_cid: desc.parent_cid,
+                            descriptor_text: desc.raw_text,
+                            rgd_offset: 0,
+                            gd_entry_count: 0,
+                            gt_cache: HashMap::new(),
+                        })
+                    } else {
+                        Err(VmdkError::InvalidGeometry(
+                            "custom descriptor has no recognised extents".into(),
+                        ))
+                    }
                 }
                 _ => Err(VmdkError::UnsupportedDiskType(
                     desc.create_type.into_string(),
@@ -1153,7 +1212,10 @@ mod tests {
             .unwrap_or_else(|e| panic!("{create_type}/{extent_kw} must open: {e:?}"));
         let mut buf = [0u8; 1];
         reader.read_exact(&mut buf).expect("read");
-        assert_eq!(buf[0], byte0, "{create_type}: must read the referenced extent");
+        assert_eq!(
+            buf[0], byte0,
+            "{create_type}: must read the referenced extent"
+        );
     }
 
     #[test]
