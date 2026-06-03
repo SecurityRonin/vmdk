@@ -21,6 +21,7 @@ mod sesparse;
 mod sparse_multi;
 
 pub use chain::VmdkChainReader;
+pub use ddb::{DiskDatabase, DiskGeometry};
 
 pub use error::VmdkError;
 
@@ -118,6 +119,8 @@ pub struct VmdkInfo {
     pub compressed: bool,
     /// Raw embedded descriptor text; empty when no embedded descriptor is present.
     pub descriptor_text: String,
+    /// Parsed `ddb.*` disk database (geometry, adapter type, versions, UUID, …).
+    pub disk_database: DiskDatabase,
 }
 
 // ── Internal format dispatch ──────────────────────────────────────────────────
@@ -487,6 +490,14 @@ impl<R: Read + Seek> VmdkReader<R> {
         &self.descriptor_text
     }
 
+    /// Parsed `ddb.*` disk database (geometry, adapter type, VM hardware / tools
+    /// versions, UUID, long content ID, thin-provisioning, encoding).
+    ///
+    /// Empty when the descriptor carries no disk database (e.g. a snapshot delta).
+    pub fn disk_database(&self) -> DiskDatabase {
+        DiskDatabase::parse(&self.descriptor_text)
+    }
+
     /// Structured snapshot of all metadata for this image.
     pub fn info(&self) -> VmdkInfo {
         let (grain_size_sectors, grain_size_bytes, compressed) = match &self.fmt {
@@ -515,6 +526,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             sector_count: self.virtual_disk_size / SECTOR_SIZE,
             compressed,
             descriptor_text: self.descriptor_text.to_string(),
+            disk_database: DiskDatabase::parse(&self.descriptor_text),
         }
     }
 
@@ -2426,6 +2438,27 @@ mod tests {
         let r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
         assert_eq!(r.cid(), 0xffff_fffe); // testutil embeds CID=fffffffe
         assert_eq!(r.parent_cid(), 0xffff_ffff);
+    }
+
+    #[test]
+    fn disk_database_accessor_and_info() {
+        let desc = "# Disk DescriptorFile\nversion=1\nCID=12345678\nparentCID=ffffffff\ncreateType=\"monolithicSparse\"\nddb.adapterType = \"lsilogic\"\nddb.geometry.cylinders = \"1024\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.virtualHWVersion = \"13\"\nddb.thinProvisioned = \"1\"\n";
+        let vmdk = testutil::test_sparse_vmdk_with_descriptor(&[0u8; 512], desc);
+        let r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        let db = r.disk_database();
+        assert_eq!(db.adapter_type.as_deref(), Some("lsilogic"));
+        assert_eq!(db.virtual_hw_version.as_deref(), Some("13"));
+        assert_eq!(db.thin_provisioned, Some(true));
+        assert_eq!(db.geometry.unwrap().chs_sectors(), 1024 * 16 * 63);
+        // Also surfaced through info().
+        assert_eq!(r.info().disk_database, db);
+    }
+
+    #[test]
+    fn disk_database_empty_for_descriptorless_image() {
+        let vmdk = test_sparse_vmdk(&[0u8; 512]); // descriptor has no ddb section
+        let r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        assert!(r.disk_database().is_empty());
     }
 
     #[test]
