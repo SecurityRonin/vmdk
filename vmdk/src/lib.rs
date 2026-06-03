@@ -1366,6 +1366,48 @@ mod tests {
         );
     }
 
+    // ── check_integrity (dangling-pointer / corruption detection) ─────────────
+
+    #[test]
+    fn check_integrity_clean_sparse_is_ok() {
+        let vmdk = test_sparse_vmdk(&[0u8; 512]);
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        let report = reader.check_integrity().expect("check_integrity");
+        assert!(report.is_ok(), "clean VMDK must report no anomalies: {report:?}");
+        assert_eq!(report.out_of_bounds_grains, 0);
+        assert_eq!(report.out_of_bounds_grain_tables, 0);
+        assert_eq!(report.grains_checked, 1, "one allocated grain in test_sparse_vmdk");
+    }
+
+    #[test]
+    fn check_integrity_flags_grain_offset_past_eof() {
+        // Patch GTE[0] to point to a grain sector far beyond EOF → dangling pointer.
+        let mut vmdk = test_sparse_vmdk(&[0u8; 512]);
+        // GT lives at sector 23 (GT_SECTOR in testutil); GTE[0] is the first 4 bytes.
+        let gt_byte = 23 * 512;
+        vmdk[gt_byte..gt_byte + 4].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes()); // huge sector
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        let report = reader.check_integrity().expect("check_integrity");
+        assert!(!report.is_ok(), "corrupted grain pointer must fail integrity");
+        assert_eq!(
+            report.out_of_bounds_grains, 1,
+            "the one out-of-bounds grain must be counted"
+        );
+    }
+
+    #[test]
+    fn check_integrity_flags_grain_table_past_eof() {
+        // Patch GD[0] to point to a GT sector far beyond EOF.
+        let mut vmdk = test_sparse_vmdk(&[0u8; 512]);
+        // GD lives at sector 21 (GD_SECTOR in testutil); GD[0] is the first 4 bytes.
+        let gd_byte = 21 * 512;
+        vmdk[gd_byte..gd_byte + 4].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes());
+        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        let report = reader.check_integrity().expect("check_integrity");
+        assert!(!report.is_ok(), "corrupted GD pointer must fail integrity");
+        assert_eq!(report.out_of_bounds_grain_tables, 1);
+    }
+
     #[test]
     fn grain_size_zero_rejected() {
         let img = vmdk_header_bytes(8, 0, 512);
