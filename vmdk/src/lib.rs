@@ -123,6 +123,31 @@ pub struct VmdkInfo {
     pub disk_database: DiskDatabase,
 }
 
+/// Provenance/integrity signals from a VMDK4 (KDMV) sparse extent header.
+///
+/// Returned by [`VmdkReader::header_provenance`]. These fields are read but
+/// discarded by both `qemu-img` and libvmdk; they carry forensic weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct HeaderProvenance {
+    /// Header format version (1, 2, or 3).
+    pub version: u32,
+    /// `uncleanShutdown` (byte 72) — the disk was not closed cleanly (crash /
+    /// power-loss / live image while the VM was running): in-flight writes may be
+    /// inconsistent.
+    pub unclean_shutdown: bool,
+    /// The four newline-detection bytes (73..77) are exactly `0A 20 0D 0A`. A
+    /// `false` here means the binary was mangled by an ASCII-mode FTP transfer
+    /// (which rewrites `\r\n`), i.e. the image is corrupt in transit.
+    pub newline_check_intact: bool,
+    /// Flag bit `0x2` — a redundant (secondary) grain directory is present.
+    pub uses_redundant_gd: bool,
+    /// Flag bit `0x10000` — grains carry compressed data.
+    pub compressed: bool,
+    /// Flag bit `0x20000` — the stream carries metadata markers (streamOptimized).
+    pub has_markers: bool,
+}
+
 // ── Internal format dispatch ──────────────────────────────────────────────────
 
 enum FormatState {
@@ -496,6 +521,30 @@ impl<R: Read + Seek> VmdkReader<R> {
     /// Empty when the descriptor carries no disk database (e.g. a snapshot delta).
     pub fn disk_database(&self) -> DiskDatabase {
         DiskDatabase::parse(&self.descriptor_text)
+    }
+
+    /// Read the VMDK4 (KDMV) sparse extent header's provenance/integrity signals
+    /// (`uncleanShutdown`, the newline-detection bytes, and the flag bits).
+    ///
+    /// Returns `Ok(None)` when the first 512 bytes are not a VMDK4 KDMV header
+    /// (COWD, seSparse, or flat extents have no such header).
+    pub fn header_provenance(&mut self) -> io::Result<Option<HeaderProvenance>> {
+        self.inner.seek(SeekFrom::Start(0))?;
+        let mut hdr = [0u8; 512];
+        self.inner.read_exact(&mut hdr)?;
+        if u32::from_le_bytes(hdr[0..4].try_into().expect("4 bytes")) != header::MAGIC {
+            return Ok(None);
+        }
+        let version = u32::from_le_bytes(hdr[4..8].try_into().expect("4 bytes"));
+        let flags = u32::from_le_bytes(hdr[8..12].try_into().expect("4 bytes"));
+        Ok(Some(HeaderProvenance {
+            version,
+            unclean_shutdown: hdr[72] != 0,
+            newline_check_intact: hdr[73..77] == [0x0A, 0x20, 0x0D, 0x0A],
+            uses_redundant_gd: flags & 0x0000_0002 != 0,
+            compressed: flags & 0x0001_0000 != 0,
+            has_markers: flags & 0x0002_0000 != 0,
+        }))
     }
 
     /// Structured snapshot of all metadata for this image.
@@ -2466,7 +2515,10 @@ mod tests {
         // test_sparse_vmdk writes a clean VMDK4 header: byte72=0, newline bytes intact.
         let vmdk = test_sparse_vmdk(&[0u8; 512]);
         let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let p = r.header_provenance().expect("provenance").expect("VMDK4 header");
+        let p = r
+            .header_provenance()
+            .expect("provenance")
+            .expect("VMDK4 header");
         assert_eq!(p.version, 1);
         assert!(!p.unclean_shutdown, "clean image");
         assert!(p.newline_check_intact, "newline bytes 0A 20 0D 0A intact");
