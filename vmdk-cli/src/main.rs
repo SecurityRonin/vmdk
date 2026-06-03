@@ -505,3 +505,144 @@ fn main() -> ExitCode {
         Command::Diff { a, b } => cmd_diff(a, b),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::path::Path;
+
+    fn data(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("vmdk/tests/data")
+            .join(name)
+    }
+
+    fn is_success(code: ExitCode) -> bool {
+        format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS)
+    }
+
+    #[test]
+    fn fmt_commas_groups_thousands() {
+        assert_eq!(fmt_commas(0), "0");
+        assert_eq!(fmt_commas(1024), "1,024");
+        assert_eq!(fmt_commas(1_048_576), "1,048,576");
+    }
+
+    #[test]
+    fn each_command_succeeds_on_a_real_image() {
+        let p = data("dfvfs_ext2.vmdk");
+        assert!(is_success(cmd_info(&p, false, false)));
+        assert!(is_success(cmd_info(&p, true, false))); // --descriptor
+        assert!(is_success(cmd_info(&p, false, true))); // --chain
+        assert!(is_success(cmd_map(&p)));
+        assert!(is_success(cmd_hash(&p)));
+        assert!(is_success(cmd_verify(&p)));
+        assert!(is_success(cmd_dump(&p, None, 0, Some(64), false))); // stdout range
+        assert!(is_success(cmd_dump(&p, None, 1024, Some(20), true))); // hex partial row
+        assert!(is_success(cmd_diff(&p, &p))); // identical
+    }
+
+    #[test]
+    fn map_all_sparse_succeeds() {
+        assert!(is_success(cmd_map(&data("minimal.vmdk"))));
+    }
+
+    #[test]
+    fn commands_fail_on_missing_or_garbage_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let garbage = dir.path().join("g.bin");
+        std::fs::write(&garbage, b"not a vmdk").unwrap();
+        for code in [
+            cmd_info(&garbage, false, false),
+            cmd_info(&garbage, true, false), // print_descriptor open error
+            cmd_info(&garbage, false, true), // chain fallback open error
+            cmd_map(&garbage),
+            cmd_hash(&garbage),
+            cmd_verify(&garbage),
+            cmd_dump(&garbage, None, 0, None, false),
+            cmd_diff(&garbage, &garbage),
+        ] {
+            assert!(!is_success(code), "garbage input must fail");
+        }
+    }
+
+    #[test]
+    fn dump_to_file_and_unwritable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("out.raw");
+        assert!(is_success(cmd_dump(
+            &data("minimal.vmdk"),
+            Some(&ok),
+            0,
+            None,
+            false
+        )));
+        assert_eq!(std::fs::metadata(&ok).unwrap().len(), 1_048_576);
+        // Uncreatable output path → failure.
+        let bad = Path::new("/no_such_dir_zzz/out.raw");
+        assert!(!is_success(cmd_dump(
+            &data("minimal.vmdk"),
+            Some(bad),
+            0,
+            None,
+            false
+        )));
+    }
+
+    #[test]
+    fn descriptor_absent_fails() {
+        // Binary VMDK with descriptor_offset/size = 0 → empty descriptor → fail.
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = vmdk::testutil::test_sparse_vmdk(&[0u8; 512]);
+        b[28..36].copy_from_slice(&0u64.to_le_bytes());
+        b[36..44].copy_from_slice(&0u64.to_le_bytes());
+        let p = dir.path().join("nodesc.vmdk");
+        std::fs::File::create(&p).unwrap().write_all(&b).unwrap();
+        assert!(!is_success(print_descriptor(&p)));
+    }
+
+    #[test]
+    fn verify_fails_on_truncated_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = std::fs::read(data("dfvfs_ext2.vmdk")).unwrap();
+        d.truncate(d.len() / 2);
+        let p = dir.path().join("trunc.vmdk");
+        std::fs::write(&p, &d).unwrap();
+        assert!(
+            !is_success(cmd_verify(&p)),
+            "truncated image fails integrity"
+        );
+    }
+
+    #[test]
+    fn diff_reports_size_and_content_differences() {
+        let dir = tempfile::tempdir().unwrap();
+        // Different virtual sizes.
+        let a = dir.path().join("a.vmdk");
+        let b = dir.path().join("b.vmdk");
+        std::fs::write(&a, vmdk::testutil::test_sparse_vmdk(&[0u8; 512])).unwrap();
+        std::fs::write(&b, std::fs::read(data("minimal.vmdk")).unwrap()).unwrap();
+        assert!(!is_success(cmd_diff(&a, &b)), "differing sizes → DIFFER");
+        // Same size, different content.
+        let mut da = vec![0u8; 512];
+        da[0] = 0xAA;
+        let mut db = vec![0u8; 512];
+        db[0] = 0xBB;
+        let c = dir.path().join("c.vmdk");
+        let e = dir.path().join("e.vmdk");
+        std::fs::write(&c, vmdk::testutil::test_sparse_vmdk(&da)).unwrap();
+        std::fs::write(&e, vmdk::testutil::test_sparse_vmdk(&db)).unwrap();
+        assert!(!is_success(cmd_diff(&c, &e)), "differing content → DIFFER");
+    }
+
+    #[test]
+    fn chain_command_on_base_and_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, delta) = vmdk::testutil::write_chain_to_dir(dir.path(), &[0u8; 512]);
+        assert!(is_success(print_chain(&base)));
+        assert!(is_success(print_chain(&delta)));
+    }
+}

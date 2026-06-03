@@ -2400,4 +2400,160 @@ mod tests {
         // Flat has no grain metadata → integrity trivially clean.
         assert!(r.check_integrity().expect("integrity").is_ok());
     }
+
+    // ── Coverage: accessors, format-specific branches, open_path arms ─────────
+
+    #[test]
+    fn cid_and_parent_cid_accessors() {
+        let vmdk = test_sparse_vmdk(&[0u8; 512]);
+        let r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        assert_eq!(r.cid(), 0xffff_fffe); // testutil embeds CID=fffffffe
+        assert_eq!(r.parent_cid(), 0xffff_ffff);
+    }
+
+    #[test]
+    fn info_and_validate_rgd_on_sesparse() {
+        let se = test_sesparse_vmdk(&[0u8; 512]);
+        let mut r = VmdkReader::open(Cursor::new(se)).expect("open");
+        let info = r.info();
+        assert_eq!(info.disk_type, "seSparse");
+        assert_eq!(info.grain_size_bytes, 8 * 512);
+        // seSparse has no RGD → validate_rgd returns false (not applicable).
+        assert!(!r.validate_rgd().expect("validate_rgd"));
+    }
+
+    #[test]
+    fn open_rejects_grain_directory_too_large() {
+        // A monolithicSparse header with an enormous capacity → GD exceeds 16 MiB.
+        let img = vmdk_header_bytes(1_000_000_000_000, 8, 512);
+        assert!(matches!(
+            VmdkReader::open(Cursor::new(img)),
+            Err(VmdkError::InvalidGeometry(_))
+        ));
+    }
+
+    /// Patch seSparse GTE[0] (grain table at sector 3, first entry) to `gte`.
+    fn sesparse_with_gte0(gte: u64) -> Vec<u8> {
+        let mut se = test_sesparse_vmdk(&[0xABu8; 512]);
+        let gt = 3 * 512; // GT_OFFSET sector in testutil layout
+        se[gt..gt + 8].copy_from_slice(&gte.to_le_bytes());
+        se
+    }
+
+    #[test]
+    fn sesparse_zero_unmapped_and_empty_gtes_read_as_zeros() {
+        for gte in [0u64, 0x1000_0000_0000_0000, 0x2000_0000_0000_0000] {
+            let mut r = VmdkReader::open(Cursor::new(sesparse_with_gte0(gte))).expect("open");
+            r.seek(SeekFrom::Start(0)).unwrap();
+            let mut buf = [0xFFu8; 512];
+            r.read_exact(&mut buf).expect("read");
+            assert_eq!(buf, [0u8; 512], "gte {gte:#x} must read as zeros");
+        }
+    }
+
+    #[test]
+    fn sesparse_unsupported_type_nibble_errors_on_read() {
+        // Nibble 0x4 is not a defined seSparse grain type.
+        let mut r =
+            VmdkReader::open(Cursor::new(sesparse_with_gte0(0x4000_0000_0000_0000))).expect("open");
+        let mut buf = [0u8; 512];
+        let err = r.read(&mut buf).expect_err("unsupported nibble must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sesparse_check_integrity_flags_grain_past_eof() {
+        // GTE points to an allocated grain index far beyond the file.
+        let mut r = VmdkReader::open(Cursor::new(sesparse_with_gte0(
+            0x3000_0000_00ff_ffff, // allocated nibble + huge grain index
+        )))
+        .expect("open");
+        let rep = r.check_integrity().expect("integrity");
+        assert!(!rep.is_ok());
+        assert_eq!(rep.out_of_bounds_grains, 1);
+    }
+
+    #[test]
+    fn custom_create_type_with_sparse_extent_opens() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = test_sparse_vmdk(&[0xC5u8; 512]);
+        std::fs::File::create(dir.path().join("disk-s001.vmdk"))
+            .unwrap()
+            .write_all(&ext)
+            .unwrap();
+        let desc = "# Disk DescriptorFile\nversion=1\nCID=ffffffff\nparentCID=ffffffff\ncreateType=\"custom\"\nRW 8 SPARSE \"disk-s001.vmdk\"\n";
+        let desc_path = dir.path().join("disk.vmdk");
+        std::fs::write(&desc_path, desc.as_bytes()).unwrap();
+        let mut r = VmdkFileReader::open_path(&desc_path).expect("custom+sparse opens");
+        let mut buf = [0u8; 1];
+        r.read_exact(&mut buf).expect("read");
+        assert_eq!(buf[0], 0xC5);
+    }
+
+    #[test]
+    fn custom_create_type_with_no_extents_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let desc = "# Disk DescriptorFile\nversion=1\nCID=ffffffff\nparentCID=ffffffff\ncreateType=\"custom\"\n";
+        let desc_path = dir.path().join("disk.vmdk");
+        std::fs::write(&desc_path, desc.as_bytes()).unwrap();
+        assert!(matches!(
+            VmdkFileReader::open_path(&desc_path),
+            Err(VmdkError::InvalidGeometry(_))
+        ));
+    }
+
+    #[test]
+    fn open_path_rejects_unknown_create_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let desc = "# Disk DescriptorFile\nversion=1\nCID=ffffffff\nparentCID=ffffffff\ncreateType=\"someFutureFormat\"\n";
+        let desc_path = dir.path().join("disk.vmdk");
+        std::fs::write(&desc_path, desc.as_bytes()).unwrap();
+        assert!(matches!(
+            VmdkFileReader::open_path(&desc_path),
+            Err(VmdkError::UnsupportedDiskType(_))
+        ));
+    }
+
+    /// A monolithicSparse VMDK with `num_gtes_per_gt` GTEs per GT and a zeroed
+    /// second grain-directory entry, so grain index `num_gtes_per_gt` resolves to
+    /// gt_sector == 0 (the "empty grain table" branch).
+    fn sparse_with_zero_gd_entry() -> Vec<u8> {
+        // capacity spans 2 grain-table groups (513 grains); GD has 2 entries.
+        // GD[0] → a real grain table (grain 0 sparse), GD[1] = 0.
+        const NGTE: u64 = 512;
+        const GRAIN: u64 = 8;
+        let capacity = (NGTE + 1) * GRAIN; // 513 grains
+        let gd_sector = 1u64;
+        let gt_sector = 2u64;
+        let total_sectors = 10u64;
+        let mut v = vec![0u8; total_sectors as usize * 512];
+        v[0..4].copy_from_slice(&0x564D_444Bu32.to_le_bytes());
+        v[4..8].copy_from_slice(&1u32.to_le_bytes());
+        v[12..20].copy_from_slice(&capacity.to_le_bytes());
+        v[20..28].copy_from_slice(&GRAIN.to_le_bytes());
+        v[44..48].copy_from_slice(&(NGTE as u32).to_le_bytes());
+        v[56..64].copy_from_slice(&gd_sector.to_le_bytes()); // gd_offset
+                                                             // GD at sector 1: entry0 → gt_sector(2), entry1 → 0 (empty).
+        let gd = gd_sector as usize * 512;
+        v[gd..gd + 4].copy_from_slice(&(gt_sector as u32).to_le_bytes());
+        // GD[1] stays 0. GT at sector 2 is all-zero → grain 0 sparse.
+        v
+    }
+
+    #[test]
+    fn sparse_empty_grain_table_entry_reads_zero_and_iterates_empty() {
+        let vmdk = sparse_with_zero_gd_entry();
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        // LBA in the second GD group (grain 512) → gt_sector == 0 branch.
+        let lba = 512 * 8; // grain 512 start
+        assert!(!r.is_allocated(lba).expect("is_allocated"));
+        // Read there → zeros (grain_location gt_sector==0 → Sparse).
+        r.seek(SeekFrom::Start(lba * 512)).unwrap();
+        let mut buf = [0xFFu8; 512];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, [0u8; 512]);
+        // iter_allocated_grains skips both the sparse GTE and the empty GD entry.
+        assert!(r.iter_allocated_grains().expect("iter").is_empty());
+    }
 }
