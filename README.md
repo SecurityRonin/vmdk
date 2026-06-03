@@ -118,12 +118,19 @@ let reader = VmdkReader::open_path(std::path::Path::new("disk.vmdk"))?;
 | `vmfsSparse` / `vmfsThin` (ESXi COWD) | ✓ (`open_path` only) |
 | `seSparse` (vSphere 6.5+ / VMFS6) | ✓ (`open_path` only) |
 | `vmfs` / `vmfsPreallocated` / `vmfsEagerZeroedThick` | ✓ (`open_path` only) |
+| `fullDevice` / `partitionedDevice` / `vmfsRaw` / `vmfsRawDeviceMap` (RDM) | ✓ (reads the mapped device when present) |
+| `custom` (arbitrary extent mix) | ✓ (`open_path` only) |
+| `ZERO` / `NOACCESS` extents | ✓ (read as zeros) |
+| header version 1 / 2 (zeroed-grain) / 3 | ✓ |
 | Snapshot / delta chains (`parentCID` + hint) | ✓ (`VmdkChainReader`) |
 
-COWD and seSparse output is validated **byte-identical to `qemu-img convert -O raw`**
+This is the **complete** createType + extent-type matrix from the VMware Virtual
+Disk Format spec, QEMU `block/vmdk.c`, and libvmdk. Device maps (`*RDM`/`fullDevice`/
+`partitionedDevice`) reference an external block device: when the mapped device path
+is present it is read like any flat extent; when absent (typical offline forensics)
+the reader returns a clear `Io(NotFound)` rather than silently succeeding. COWD and
+seSparse output is validated **byte-identical to `qemu-img convert -O raw`**
 (QEMU's independent parser) — see [docs/validation.md](docs/validation.md).
-Physical Raw Device Maps (`vmfsRDM`/`vmfsRDMP`) are intentionally unsupported:
-they reference a physical device and carry no readable data.
 
 `VmdkReader::open` and `open_path` return `Err` (never panic) on unrecognised inputs.
 
@@ -143,7 +150,7 @@ Virtual offset resolution is O(1): one GD lookup (in-memory `Vec<u32>`) + one GT
 
 ## Testing
 
-- **125 tests** across unit, integration real-images, and synthetic suites
+- **130 tests** across unit, integration real-images, and synthetic suites
 - Validated against real VMware-generated images from the [dfvfs](https://github.com/log2timeline/dfvfs)
   and [plaso](https://github.com/log2timeline/plaso) forensics test corpora
 - **COWD & seSparse validated byte-identical to `qemu-img`** — independent-parser

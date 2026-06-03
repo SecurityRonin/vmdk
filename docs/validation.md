@@ -234,6 +234,10 @@ Descriptor-only test committed as `ms3-win.vmdk` (see corpus file 6 above).
 | `vmfsSparse` / `vmfsThin` (COWD) | Yes (qemu-img) | `cowd_reader_matches_qemu_img` — byte-identical to qemu-img |
 | `seSparse` (vSphere 6.5+ VMFS6) | Yes (qemu-img) | `sesparse_reader_matches_qemu_img` — byte-identical to qemu-img |
 | `vmfs` / `vmfsPreallocated` flat | Unit test | `open_path` routes VMFS extent type as flat |
+| `ZERO` / `NOACCESS` extents | Unit test | file-less extents read as zeros |
+| header version 2 (zeroed-grain) | Unit test | `header_version_2_zeroed_grain_opens` |
+| `custom` createType | Unit test | routed by extent composition |
+| `fullDevice` / `partitionedDevice` / `vmfsRaw` / RDM | Unit test | routed to flat reader; reads mapped device path |
 | Snapshot / delta chain | Unit test | `VmdkChainReader` over base + delta |
 | RGD ↔ primary GD cross-check | Unit test | `validate_rgd()` |
 | `adapterType = lsilogic` | External | pWnOS v2.0 |
