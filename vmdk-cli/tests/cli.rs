@@ -113,6 +113,36 @@ fn info_shows_flat_vmdk_disk_type() {
     );
 }
 
+#[test]
+fn info_lists_companion_extent_files() {
+    // A multi-file VMDK's info must name the companion file(s) to collect.
+    let out = vmdk_bin()
+        .args(["info", &data_path("flat.vmdk")])
+        .output()
+        .expect("vmdk binary must run");
+    assert!(out.status.success(), "exit: {}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("flat-f001.vmdk"),
+        "info must list the companion extent file, got: {stdout}"
+    );
+}
+
+#[test]
+fn info_omits_dependencies_for_self_contained() {
+    // A self-contained binary VMDK must not print a dependencies section.
+    let out = vmdk_bin()
+        .args(["info", &data_path("dfvfs_ext2.vmdk")])
+        .output()
+        .expect("vmdk binary must run");
+    assert!(out.status.success(), "exit: {}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.to_lowercase().contains("companion") && !stdout.to_lowercase().contains("depends"),
+        "self-contained VMDK must omit the dependencies section, got: {stdout}"
+    );
+}
+
 // ── info --descriptor (folds in old `descriptor` command) ─────────────────────
 
 #[test]
