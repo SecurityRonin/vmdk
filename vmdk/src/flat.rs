@@ -20,7 +20,8 @@ struct FlatExtent {
     byte_end: u64,
     /// Byte offset in the extent file where this extent's data begins.
     file_offset: u64,
-    file: BufReader<File>,
+    /// `None` for a ZERO extent (no backing file — reads as zeros).
+    file: Option<BufReader<File>>,
 }
 
 impl MultiExtentReader {
@@ -29,11 +30,15 @@ impl MultiExtentReader {
         let mut virt = 0u64;
         for ext in extents {
             let size_bytes = ext.size_sectors * 512;
-            let path = base_dir.join(ext.filename.as_ref());
-            let file = BufReader::new(
-                File::open(&path)
-                    .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?,
-            );
+            // ZERO extents (and NOACCESS holes) have no backing file — they read as zeros.
+            let file = if ext.is_zero {
+                None
+            } else {
+                let path = base_dir.join(ext.filename.as_ref());
+                Some(BufReader::new(File::open(&path).map_err(|e| {
+                    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+                })?))
+            };
             flat.push(FlatExtent {
                 byte_start: virt,
                 byte_end: virt + size_bytes,
@@ -64,9 +69,17 @@ impl Read for MultiExtentReader {
         let remaining_in_extent = (ext.byte_end - self.pos) as usize;
         let remaining_total = (self.total_bytes - self.pos) as usize;
         let to_read = buf.len().min(remaining_in_extent).min(remaining_total);
-        ext.file
-            .seek(SeekFrom::Start(ext.file_offset + offset_in_extent))?;
-        let n = ext.file.read(&mut buf[..to_read])?;
+        let n = match &mut ext.file {
+            Some(file) => {
+                file.seek(SeekFrom::Start(ext.file_offset + offset_in_extent))?;
+                file.read(&mut buf[..to_read])?
+            }
+            None => {
+                // ZERO extent: emit zeros without touching disk.
+                buf[..to_read].fill(0);
+                to_read
+            }
+        };
         self.pos += n as u64;
         Ok(n)
     }

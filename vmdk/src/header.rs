@@ -4,6 +4,8 @@ use crate::error::{Result, VmdkError};
 
 pub const MAGIC: u32 = 0x564D_444B;
 pub const VERSION: u32 = 1;
+/// Version 2 enables the zeroed-grain feature (GTE == 1 → explicit zero grain).
+pub const VERSION_ZEROED_GRAIN: u32 = 2;
 pub const VERSION_STREAM_OPT: u32 = 3;
 pub const SECTOR_SIZE: u64 = 512;
 
@@ -40,7 +42,9 @@ impl SparseExtentHeader {
         }
 
         let version = u32::from_le_bytes(data[4..8].try_into().expect("4 bytes"));
-        if version != VERSION && version != VERSION_STREAM_OPT {
+        // Accept v1 (base), v2 (zeroed-grain feature) and v3 (streamOptimized).
+        // QEMU accepts any VMDK4-magic version; we cap at the three defined values.
+        if version != VERSION && version != VERSION_ZEROED_GRAIN && version != VERSION_STREAM_OPT {
             return Err(VmdkError::UnsupportedVersion(version));
         }
 
@@ -59,7 +63,7 @@ impl SparseExtentHeader {
         // (2-byte zlib header + DEFLATE stream + Adler-32 trailer).  Use ZlibDecoder,
         // not DeflateDecoder — the spec has a documentation error.
         match (version, compress_algorithm) {
-            (VERSION, 0) | (VERSION_STREAM_OPT, 1) => {}
+            (VERSION | VERSION_ZEROED_GRAIN, 0) | (VERSION_STREAM_OPT, 1) => {}
             _ => return Err(VmdkError::CompressedNotSupported),
         }
 

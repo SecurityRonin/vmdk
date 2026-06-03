@@ -28,6 +28,8 @@ pub(crate) struct ExtentEntry {
     pub filename: Box<str>,
     /// Byte offset into the extent file where this extent's data begins.
     pub file_byte_offset: u64,
+    /// `true` for a `ZERO` extent: no backing file, reads as zeros.
+    pub is_zero: bool,
 }
 
 /// A single sparse extent entry from the descriptor (twoGbMaxExtentSparse).
@@ -100,15 +102,19 @@ pub(crate) fn parse_text_descriptor(text: &str) -> Result<TextDescriptor> {
     })
 }
 
-/// Parse `<access> <n> FLAT "<file>" <sector_offset>` lines.
+/// Parse a flat-style extent line:
+///   `RW <n> FLAT "<file>" <sector_offset>` — preallocated raw extent
+///   `RW <n> VMFS "<file>"`                 — ESXi flat extent (offset implied 0)
+///   `RW <n> ZERO`                          — backing-file-less zero-filled extent
 ///
-/// Returns `None` for non-FLAT types, blank lines, comment lines, or malformed input.
+/// Returns `None` for sparse/other types, blank lines, comments, or malformed input.
 fn try_parse_flat_extent(line: &str) -> Option<ExtentEntry> {
     let mut rest = line;
 
-    // Access token: RW | RDONLY (NOACCESS extents have no associated data)
+    // Access token: RW | RDONLY | NOACCESS. NOACCESS marks an inaccessible hole,
+    // which we treat like ZERO (reads as zeros) so the virtual geometry is preserved.
     let (access, tail) = split_token(rest)?;
-    if !matches!(access, "RW" | "RDONLY") {
+    if !matches!(access, "RW" | "RDONLY" | "NOACCESS") {
         return None;
     }
     rest = tail;
@@ -118,12 +124,22 @@ fn try_parse_flat_extent(line: &str) -> Option<ExtentEntry> {
     let size_sectors: u64 = sectors_str.parse().ok()?;
     rest = tail;
 
-    // Extent type — FLAT and VMFS are flat (preallocated) extent types
+    // Extent type — FLAT/VMFS are file-backed; ZERO has no file.
     let (ext_type, tail) = split_token(rest)?;
-    if !matches!(ext_type, "FLAT" | "VMFS") {
+    if !matches!(ext_type, "FLAT" | "VMFS" | "ZERO") {
         return None;
     }
     rest = tail.trim_start();
+
+    // ZERO (and NOACCESS) extents carry no filename or offset.
+    if ext_type == "ZERO" || access == "NOACCESS" {
+        return Some(ExtentEntry {
+            size_sectors,
+            filename: Box::from(""),
+            file_byte_offset: 0,
+            is_zero: true,
+        });
+    }
 
     // Filename: bare word or double-quoted (may contain spaces)
     let (filename, remaining) = if let Some(inner) = rest.strip_prefix('"') {
@@ -140,6 +156,7 @@ fn try_parse_flat_extent(line: &str) -> Option<ExtentEntry> {
         size_sectors,
         filename: Box::from(filename),
         file_byte_offset: file_sector_offset * 512,
+        is_zero: false,
     })
 }
 
