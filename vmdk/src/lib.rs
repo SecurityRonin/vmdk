@@ -2557,6 +2557,39 @@ mod tests {
     }
 
     #[test]
+    fn change_track_path_reference() {
+        let desc = "# Disk DescriptorFile\nversion=1\nCID=12345678\nparentCID=ffffffff\ncreateType=\"monolithicSparse\"\nchangeTrackPath=\"disk-ctk.vmdk\"\n";
+        let vmdk = testutil::test_sparse_vmdk_with_descriptor(&[0u8; 512], desc);
+        let r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        assert_eq!(r.change_track_path().as_deref(), Some("disk-ctk.vmdk"));
+    }
+
+    #[test]
+    fn change_track_path_absent() {
+        let vmdk = test_sparse_vmdk(&[0u8; 512]);
+        let r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        assert_eq!(r.change_track_path(), None);
+    }
+
+    #[test]
+    fn effective_content_id_uses_long_cid_on_sentinel() {
+        // CID=fffffffe is the "use the long content identifier" sentinel.
+        let desc = "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType=\"monolithicSparse\"\nddb.longContentID = \"deadbeefcafef00d1122334455667788\"\n";
+        let vmdk = testutil::test_sparse_vmdk_with_descriptor(&[0u8; 512], desc);
+        let r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        assert_eq!(r.cid(), 0xffff_fffe);
+        assert_eq!(r.effective_content_id(), "deadbeefcafef00d1122334455667788");
+    }
+
+    #[test]
+    fn effective_content_id_uses_short_cid_normally() {
+        let desc = "# Disk DescriptorFile\nversion=1\nCID=12345678\nparentCID=ffffffff\ncreateType=\"monolithicSparse\"\n";
+        let vmdk = testutil::test_sparse_vmdk_with_descriptor(&[0u8; 512], desc);
+        let r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        assert_eq!(r.effective_content_id(), "12345678");
+    }
+
+    #[test]
     fn info_and_validate_rgd_on_sesparse() {
         let se = test_sesparse_vmdk(&[0u8; 512]);
         let mut r = VmdkReader::open(Cursor::new(se)).expect("open");
