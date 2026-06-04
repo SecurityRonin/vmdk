@@ -115,8 +115,8 @@ pub(crate) fn open_sesparse<R: Read + Seek>(
     let grain_size_bytes = hdr.grain_size * SECTOR_SIZE;
 
     // The number of GD entries = ceil(num_grains / GTES_PER_GT).
-    let num_grains = (hdr.capacity + hdr.grain_size - 1) / hdr.grain_size;
-    let num_gts = (num_grains + SE_GTES_PER_GT - 1) / SE_GTES_PER_GT;
+    let num_grains = hdr.capacity.div_ceil(hdr.grain_size);
+    let num_gts = num_grains.div_ceil(SE_GTES_PER_GT);
     // At least one GD entry even for a sub-grain-table-sized disk.
     let num_gts = num_gts.max(1);
 

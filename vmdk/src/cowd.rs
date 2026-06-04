@@ -1,4 +1,4 @@
-//! COWD (Copy-On-Write Disk) sparse extent reader — used by VMware ESXi vmfsSparse/vmfsThin.
+//! COWD (Copy-On-Write Disk) sparse extent reader — used by `VMware` `ESXi` vmfsSparse/vmfsThin.
 //!
 //! Magic: `"COWD"` = `0x43_4F_57_44` (big-endian) at byte 0.
 //! All header fields are little-endian `u32` (vs `u64` in VMDK4).
@@ -81,9 +81,8 @@ pub(crate) fn open_cowd<R: Read + Seek>(mut reader: R) -> Result<(Vec<u32>, u64)
         .checked_mul(SECTOR_SIZE)
         .ok_or_else(|| VmdkError::InvalidGeometry("COWD grain_size overflow".into()))?;
 
-    let num_grains =
-        (u64::from(hdr.capacity) + u64::from(hdr.grain_size) - 1) / u64::from(hdr.grain_size);
-    let num_gts = (num_grains + COWD_GTES_PER_GT as u64 - 1) / COWD_GTES_PER_GT as u64;
+    let num_grains = u64::from(hdr.capacity).div_ceil(u64::from(hdr.grain_size));
+    let num_gts = num_grains.div_ceil(COWD_GTES_PER_GT as u64);
 
     // `capacity` is a u32 and `grain_size >= 1`, so num_gts <= u32::MAX / 4096 and the
     // grain directory is at most ~4 MiB — no explicit cap is needed (it cannot exceed

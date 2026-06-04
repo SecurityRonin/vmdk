@@ -104,7 +104,7 @@ pub(crate) fn parse_text_descriptor(text: &str) -> Result<TextDescriptor> {
 
 /// Parse a flat-style extent line:
 ///   `RW <n> FLAT "<file>" <sector_offset>` — preallocated raw extent
-///   `RW <n> VMFS "<file>"`                 — ESXi flat extent (offset implied 0)
+///   `RW <n> VMFS "<file>"`                 — `ESXi` flat extent (offset implied 0)
 ///   `RW <n> ZERO`                          — backing-file-less zero-filled extent
 ///
 /// Returns `None` for sparse/other types, blank lines, comments, or malformed input.

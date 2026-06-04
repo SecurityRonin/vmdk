@@ -69,16 +69,13 @@ impl Read for MultiExtentReader {
         let remaining_in_extent = (ext.byte_end - self.pos) as usize;
         let remaining_total = (self.total_bytes - self.pos) as usize;
         let to_read = buf.len().min(remaining_in_extent).min(remaining_total);
-        let n = match &mut ext.file {
-            Some(file) => {
-                file.seek(SeekFrom::Start(ext.file_offset + offset_in_extent))?;
-                file.read(&mut buf[..to_read])?
-            }
-            None => {
-                // ZERO extent: emit zeros without touching disk.
-                buf[..to_read].fill(0);
-                to_read
-            }
+        let n = if let Some(file) = &mut ext.file {
+            file.seek(SeekFrom::Start(ext.file_offset + offset_in_extent))?;
+            file.read(&mut buf[..to_read])?
+        } else {
+            // ZERO extent: emit zeros without touching disk.
+            buf[..to_read].fill(0);
+            to_read
         };
         self.pos += n as u64;
         Ok(n)

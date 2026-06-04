@@ -129,6 +129,10 @@ pub struct VmdkInfo {
 /// discarded by both `qemu-img` and libvmdk; they carry forensic weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// Each bool is an independent provenance signal (unclean shutdown, FTP-mangling,
+// redundant GD, compression, markers) read straight from distinct header bytes/flags;
+// collapsing them into an enum would lose the one-field-per-signal clarity.
+#[allow(clippy::struct_excessive_bools)]
 pub struct HeaderProvenance {
     /// Header format version (1, 2, or 3).
     pub version: u32,
@@ -693,7 +697,7 @@ impl<R: Read + Seek> VmdkReader<R> {
         // Extract all values from self.fmt before any mutable borrow of self.inner.
         let virtual_offset = lba * SECTOR_SIZE;
         match &self.fmt {
-            FormatState::Flat => return Ok(true),
+            FormatState::Flat => Ok(true),
             FormatState::Sparse {
                 grain_dir,
                 grain_size_bytes,
@@ -704,7 +708,7 @@ impl<R: Read + Seek> VmdkReader<R> {
                 let gd_idx = (grain_idx / num_gtes_per_gt) as usize;
                 let gte_idx = grain_idx % num_gtes_per_gt;
                 let gt_sector = grain_dir.get(gd_idx).copied().unwrap_or(0);
-                let _ = ();
+                let () = ();
                 if gt_sector == 0 {
                     return Ok(false);
                 }
@@ -712,7 +716,7 @@ impl<R: Read + Seek> VmdkReader<R> {
                 self.inner.seek(SeekFrom::Start(gte_pos))?;
                 let mut b = [0u8; 4];
                 self.inner.read_exact(&mut b)?;
-                return Ok(u32::from_le_bytes(b) > 1);
+                Ok(u32::from_le_bytes(b) > 1)
             }
             FormatState::SeSparse {
                 grain_dir,
@@ -732,7 +736,7 @@ impl<R: Read + Seek> VmdkReader<R> {
                     return Ok(false);
                 };
                 // Allocated only when the GTE type nibble is "allocated" (0x3).
-                return Ok(gte & sesparse::SE_GTE_TYPE_MASK == sesparse::SE_GTE_TYPE_ALLOCATED);
+                Ok(gte & sesparse::SE_GTE_TYPE_MASK == sesparse::SE_GTE_TYPE_ALLOCATED)
             }
         }
     }
@@ -1307,8 +1311,8 @@ impl<R: Read + Seek> Read for VmdkReader<R> {
         let grain_size_bytes = match &self.fmt {
             FormatState::Sparse {
                 grain_size_bytes, ..
-            } => *grain_size_bytes,
-            FormatState::SeSparse {
+            }
+            | FormatState::SeSparse {
                 grain_size_bytes, ..
             } => *grain_size_bytes,
             FormatState::Flat => unreachable!(),
@@ -1849,8 +1853,7 @@ mod tests {
         std::process::Command::new("qemu-img")
             .arg("--version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Write `extent_bytes` + a descriptor of `create_type`/`extent_kw`, then compare
@@ -2551,7 +2554,9 @@ mod tests {
         assert_eq!(p.version, 1);
         assert!(!p.unclean_shutdown, "clean image");
         assert!(p.newline_check_intact, "newline bytes 0A 20 0D 0A intact");
-        assert!(!p.uses_redundant_gd || p.uses_redundant_gd); // flag presence is fine either way
+        // The fixture writes flags=0 (testutil sets bytes 8..12 to zero), so the
+        // redundant-GD flag bit (0x2) is clear even though an rgdOffset is present.
+        assert!(!p.uses_redundant_gd, "flags=0 ⇒ no redundant-GD flag bit");
     }
 
     #[test]
@@ -2724,7 +2729,7 @@ mod tests {
 
     /// A monolithicSparse VMDK with `num_gtes_per_gt` GTEs per GT and a zeroed
     /// second grain-directory entry, so grain index `num_gtes_per_gt` resolves to
-    /// gt_sector == 0 (the "empty grain table" branch).
+    /// `gt_sector` == 0 (the "empty grain table" branch).
     fn sparse_with_zero_gd_entry() -> Vec<u8> {
         // capacity spans 2 grain-table groups (513 grains); GD has 2 entries.
         // GD[0] → a real grain table (grain 0 sparse), GD[1] = 0.

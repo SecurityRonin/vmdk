@@ -1,6 +1,6 @@
 //! Snapshot/delta chain reader: layers a delta VMDK on top of its parent chain.
 //!
-//! Given a delta VMDK (parentCID != 0xffff_ffff), opens the parent referenced by
+//! Given a delta VMDK (parentCID != `0xffff_ffff`), opens the parent referenced by
 //! `parentFileNameHint`, validates that the parent's CID matches the delta's parentCID,
 //! and presents a unified `Read + Seek` view where:
 //! - allocated sectors in the delta are read from the delta
@@ -78,7 +78,9 @@ impl VmdkChainReader {
             current_path = parent_path;
         }
 
-        let virtual_disk_size = layers.first().map(|r| r.virtual_disk_size()).unwrap_or(0);
+        let virtual_disk_size = layers
+            .first()
+            .map_or(0, super::VmdkReader::virtual_disk_size);
         Ok(VmdkChainReader {
             layers,
             virtual_disk_size,

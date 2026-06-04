@@ -18,4 +18,3 @@ doc   = false
 [dependencies]
 libfuzzer-sys = "0.4"
 vmdk          = { path = "../vmdk" }
-tempfile      = "3"

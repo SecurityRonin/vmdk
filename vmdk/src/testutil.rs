@@ -80,7 +80,7 @@ pub fn test_sparse_vmdk(sector_data: &[u8]) -> Vec<u8> {
 /// Layout:
 /// Sector 0:    constant header (magic CAFEBABE, version, capacity, etc.)
 /// Sector 1:    volatile header (magic CAFECAFE) — unused but structurally required
-/// Sectors 2-9: padding to sector 10 (gd_offset)
+/// Sectors 2-9: padding to sector 10 (`gd_offset`)
 /// Sector 10:   GD (one u64 entry = 1, pointing to GT table index 1)
 /// Sectors 11-74: GT (index 1 = sectors 11 to 74; 64 sectors = 4096 × 8-byte GTEs)
 ///              GTE[0] = sector 75 (grain data)
@@ -215,9 +215,9 @@ pub fn write_chain_to_dir(
     let base_bytes = test_sparse_vmdk_with_descriptor(base_data, base_desc);
     let base_path = dir.join("base.vmdk");
     std::fs::File::create(&base_path)
-        .unwrap()
+        .expect("create base.vmdk")
         .write_all(&base_bytes)
-        .unwrap();
+        .expect("write base.vmdk");
 
     // Delta has grain 0 sparse (all-zeros grain table) so reads fall through to base.
     let delta_desc = "# Disk DescriptorFile\nversion=1\nCID=00000002\nparentCID=00000001\nparentFileNameHint=\"base.vmdk\"\ncreateType=\"monolithicSparse\"\n";
@@ -230,9 +230,9 @@ pub fn write_chain_to_dir(
     delta_bytes[gt_offset..gt_offset + 4].copy_from_slice(&0u32.to_le_bytes());
     let delta_path = dir.join("delta.vmdk");
     std::fs::File::create(&delta_path)
-        .unwrap()
+        .expect("create delta.vmdk")
         .write_all(&delta_bytes)
-        .unwrap();
+        .expect("write delta.vmdk");
 
     (base_path, delta_path)
 }

@@ -55,7 +55,7 @@ enum Command {
         chain: bool,
     },
 
-    /// List allocated (non-sparse) grain ranges as start_lba,sector_count
+    /// List allocated (non-sparse) grain ranges as `start_lba,sector_count`
     Map { path: PathBuf },
 
     /// Output virtual disk bytes — to stdout, a file (-o), or as a hex dump (--hex)
@@ -155,10 +155,10 @@ fn cmd_info(path: &std::path::Path, descriptor: bool, chain: bool) -> ExitCode {
         if !deps.is_empty() {
             println!("Companion files:   {} extent(s) required:", deps.len());
             for d in &deps {
-                let name = d
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| d.to_string_lossy().into_owned());
+                let name = d.file_name().map_or_else(
+                    || d.to_string_lossy().into_owned(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
                 let present = if d.exists() { "" } else { "  (MISSING)" };
                 println!("                   - {name}{present}");
             }
@@ -197,13 +197,13 @@ fn print_chain(path: &std::path::Path) -> ExitCode {
                     let info = r.info();
                     println!("Chain depth:  1 layer");
                     println!("Virtual size: {} bytes", fmt_commas(info.virtual_disk_size));
-                    if info.parent_cid != 0xffff_ffff {
+                    if info.parent_cid == 0xffff_ffff {
+                        println!("No parent (base image)");
+                    } else {
                         println!(
                             "Parent CID:   {:08x} (parent file not found: {e})",
                             info.parent_cid
                         );
-                    } else {
-                        println!("No parent (base image)");
                     }
                     ExitCode::SUCCESS
                 }
@@ -320,9 +320,9 @@ fn dump_hex<R: Read>(reader: &mut R, start_offset: u64, length: u64) -> io::Resu
             break;
         }
         let _ = write!(w, "{pos:08x}  ");
-        for i in 0..16 {
+        for (i, &byte) in buf.iter().enumerate() {
             if i < n {
-                let _ = write!(w, "{:02x} ", buf[i]);
+                let _ = write!(w, "{byte:02x} ");
             } else {
                 let _ = write!(w, "   ");
             }
@@ -652,7 +652,7 @@ mod tests {
     }
 
     /// A sparse VMDK that opens (header + GD are in bounds) but whose grain table
-    /// and RGD point past EOF, so iter_allocated_grains and validate_rgd fail.
+    /// and RGD point past EOF, so `iter_allocated_grains` and `validate_rgd` fail.
     fn opens_but_gt_and_rgd_dangle() -> Vec<u8> {
         let mut v = vec![0u8; 1024]; // header (sector 0) + GD (sector 1)
         v[0..4].copy_from_slice(&0x564D_444Bu32.to_le_bytes());

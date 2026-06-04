@@ -1,6 +1,6 @@
 //! VMDK disk database (`ddb.*`) — the descriptor's metadata namespace.
 //!
-//! VMware writes a `# The Disk Data Base` section of `ddb.<key> = "<value>"` pairs
+//! `VMware` writes a `# The Disk Data Base` section of `ddb.<key> = "<value>"` pairs
 //! at the end of the descriptor: virtual geometry, controller type, VM hardware /
 //! tools versions, disk UUID, long content ID, thin-provisioning, and the
 //! descriptor text encoding. Both `qemu-img` and libvmdk parse the descriptor but
@@ -8,7 +8,7 @@
 //! (image dating, controller provenance, cross-snapshot disk identity).
 //!
 //! Source: libvmdk VMDK format spec — "The disk database"
-//!   https://github.com/libyal/libvmdk/blob/main/documentation/VMware%20Virtual%20Disk%20Format%20(VMDK).asciidoc
+//!   <https://github.com/libyal/libvmdk/blob/main/documentation/VMware%20Virtual%20Disk%20Format%20(VMDK).asciidoc>
 
 /// Virtual disk CHS geometry from `ddb.geometry.{cylinders,heads,sectors}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,7 +43,7 @@ pub struct DiskDatabase {
     pub bios_geometry: Option<DiskGeometry>,
     /// `ddb.virtualHWVersion` — VM hardware version (dates the creating platform).
     pub virtual_hw_version: Option<String>,
-    /// `ddb.toolsVersion` — installed VMware Tools build.
+    /// `ddb.toolsVersion` — installed `VMware` Tools build.
     pub tools_version: Option<String>,
     /// `ddb.uuid` — disk UUID (space-separated hex bytes as written).
     pub uuid: Option<String>,
