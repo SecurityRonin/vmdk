@@ -2968,6 +2968,68 @@ mod tests {
         );
     }
 
+    /// Build a two-copy sparse VMDK where the *primary* grain table has its GTE[0]
+    /// zeroed (a lost grain pointer) but the *redundant* grain table still holds the
+    /// valid pointer. Layout (sectors): 0 header, 1..21 descriptor, 21 primary GD,
+    /// 22 RGD, 23..27 primary GT (GTE[0]=0), 27..31 redundant GT (GTE[0]=31),
+    /// 31..39 grain (0xAB).
+    fn two_copy_vmdk_with_lost_primary_gte() -> Vec<u8> {
+        const S: usize = 512;
+        let mut hdr = vec![0u8; S];
+        hdr[0..4].copy_from_slice(&header::MAGIC.to_le_bytes());
+        hdr[4..8].copy_from_slice(&1u32.to_le_bytes());
+        hdr[12..20].copy_from_slice(&8u64.to_le_bytes()); // capacity (1 grain)
+        hdr[20..28].copy_from_slice(&8u64.to_le_bytes()); // grain_size
+        hdr[28..36].copy_from_slice(&1u64.to_le_bytes()); // descriptor_offset
+        hdr[36..44].copy_from_slice(&20u64.to_le_bytes()); // descriptor_size
+        hdr[44..48].copy_from_slice(&512u32.to_le_bytes()); // num_gtes_per_gt
+        hdr[48..56].copy_from_slice(&22u64.to_le_bytes()); // rgd_offset
+        hdr[56..64].copy_from_slice(&21u64.to_le_bytes()); // gd_offset
+        hdr[64..72].copy_from_slice(&31u64.to_le_bytes()); // overhead
+        hdr[73..77].copy_from_slice(&[0x0A, 0x20, 0x0D, 0x0A]);
+
+        let mut desc = vec![0u8; 20 * S];
+        let text = "# Disk DescriptorFile\nversion=1\nCID=12345678\nparentCID=ffffffff\ncreateType=\"monolithicSparse\"\n";
+        desc[..text.len()].copy_from_slice(text.as_bytes());
+
+        let mut gd = vec![0u8; S];
+        gd[0..4].copy_from_slice(&23u32.to_le_bytes()); // primary GT @ sector 23
+        let mut rgd = vec![0u8; S];
+        rgd[0..4].copy_from_slice(&27u32.to_le_bytes()); // redundant GT @ sector 27
+
+        let primary_gt = vec![0u8; 4 * S]; // GTE[0] = 0 — lost pointer
+        let mut redundant_gt = vec![0u8; 4 * S];
+        redundant_gt[0..4].copy_from_slice(&31u32.to_le_bytes()); // grain @ sector 31
+
+        let grain = vec![0xABu8; 8 * S];
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&hdr);
+        v.extend_from_slice(&desc);
+        v.extend_from_slice(&gd);
+        v.extend_from_slice(&rgd);
+        v.extend_from_slice(&primary_gt);
+        v.extend_from_slice(&redundant_gt);
+        v.extend_from_slice(&grain);
+        v
+    }
+
+    #[test]
+    fn rgd_fallback_recovers_grain_from_lost_primary_gte() {
+        let vmdk = two_copy_vmdk_with_lost_primary_gte();
+        // Without fallback the lost primary GTE reads as sparse (zeros).
+        let mut r = VmdkReader::open(Cursor::new(vmdk.clone())).expect("open");
+        let mut buf = [0xFFu8; 512];
+        r.read_exact(&mut buf).expect("read");
+        assert_eq!(buf, [0u8; 512], "lost primary GTE reads sparse without recovery");
+        // With fallback the grain is recovered from the redundant grain table.
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        r.enable_rgd_fallback();
+        let mut buf = [0u8; 512];
+        r.read_exact(&mut buf).expect("read");
+        assert_eq!(buf, [0xAB; 512], "grain recovered from redundant GT entry");
+    }
+
     #[test]
     fn iter_allocated_grains_recovers_via_rgd() {
         // The allocation scan walks the grain directory directly; a damaged primary GD
