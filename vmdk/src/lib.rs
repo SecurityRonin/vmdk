@@ -1000,7 +1000,13 @@ impl<R: Read + Seek> VmdkReader<R> {
         let grain_sectors = grain_size_bytes / SECTOR_SIZE;
         let mut result = Vec::new();
 
-        for (gd_idx, &gt_sector) in grain_dir.iter().enumerate() {
+        for (gd_idx, &primary_gt_sector) in grain_dir.iter().enumerate() {
+            // Recovery mode: resolve a damaged primary pointer through the RGD.
+            let gt_sector = if self.rgd_fallback {
+                self.resilient_gt_sector(gd_idx, primary_gt_sector, num_gtes_per_gt)?
+            } else {
+                primary_gt_sector
+            };
             if gt_sector == 0 {
                 continue;
             }
