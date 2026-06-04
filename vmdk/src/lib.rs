@@ -1001,27 +1001,52 @@ impl<R: Read + Seek> VmdkReader<R> {
         let mut result = Vec::new();
 
         for (gd_idx, &primary_gt_sector) in grain_dir.iter().enumerate() {
-            // Recovery mode: resolve a damaged primary pointer through the RGD.
+            // Recovery mode: resolve a damaged primary pointer through the RGD, and load
+            // the redundant grain table once so individually lost primary entries can be
+            // recovered from it.
             let gt_sector = if self.rgd_fallback {
                 self.resilient_gt_sector(gd_idx, primary_gt_sector, num_gtes_per_gt)?
             } else {
                 primary_gt_sector
             };
-            if gt_sector == 0 {
+            let redundant_gt = if self.rgd_fallback {
+                self.read_redundant_gt(gd_idx, num_gtes_per_gt)?
+            } else {
+                None
+            };
+            if gt_sector == 0 && redundant_gt.is_none() {
                 continue;
             }
-            let gt_byte_offset = u64::from(gt_sector) * SECTOR_SIZE;
             let gt_size = num_gtes_per_gt as usize * 4;
-            self.inner.seek(SeekFrom::Start(gt_byte_offset))?;
-            let mut gt_bytes = vec![0u8; gt_size];
-            self.inner.read_exact(&mut gt_bytes)?;
+            let gt_bytes = if gt_sector == 0 {
+                vec![0u8; gt_size]
+            } else {
+                let gt_byte_offset = u64::from(gt_sector) * SECTOR_SIZE;
+                self.inner.seek(SeekFrom::Start(gt_byte_offset))?;
+                let mut b = vec![0u8; gt_size];
+                self.inner.read_exact(&mut b)?;
+                b
+            };
 
             for gte_idx in 0..num_gtes_per_gt as usize {
-                let gte = u32::from_le_bytes(
+                let mut gte = u32::from_le_bytes(
                     gt_bytes[gte_idx * 4..gte_idx * 4 + 4]
                         .try_into()
                         .expect("4 bytes"),
                 );
+                // Recover a lost primary entry from the redundant grain table.
+                if gte <= 1 {
+                    if let Some(rgt) = &redundant_gt {
+                        let rgte = u32::from_le_bytes(
+                            rgt[gte_idx * 4..gte_idx * 4 + 4]
+                                .try_into()
+                                .expect("4 bytes"),
+                        );
+                        if rgte > 1 {
+                            gte = rgte;
+                        }
+                    }
+                }
                 if gte > 1 {
                     let grain_idx = gd_idx as u64 * num_gtes_per_gt + gte_idx as u64;
                     let start_lba = grain_idx * grain_sectors;
@@ -1138,6 +1163,29 @@ impl<R: Read + Seek> VmdkReader<R> {
         let mut b = [0u8; 4];
         self.inner.read_exact(&mut b)?;
         Ok(u32::from_le_bytes(b))
+    }
+
+    /// Read the full redundant grain table referenced by RGD entry `gd_idx`, or `None`
+    /// if the RGD entry is absent or the grain table would fall outside the file.
+    fn read_redundant_gt(
+        &mut self,
+        gd_idx: usize,
+        num_gtes_per_gt: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let file_len = self.inner.seek(SeekFrom::End(0))?;
+        let sector = self.rgd_dir_entry(gd_idx, file_len)?;
+        if sector == 0 {
+            return Ok(None);
+        }
+        let gt_byte = u64::from(sector) * SECTOR_SIZE;
+        let gt_byte_len = num_gtes_per_gt * 4;
+        if gt_byte.saturating_add(gt_byte_len) > file_len {
+            return Ok(None);
+        }
+        self.inner.seek(SeekFrom::Start(gt_byte))?;
+        let mut b = vec![0u8; gt_byte_len as usize];
+        self.inner.read_exact(&mut b)?;
+        Ok(Some(b))
     }
 
     /// Read grain-table entry `gte_idx` from the redundant grain table referenced by
