@@ -252,6 +252,9 @@ pub struct VmdkReader<R: Read + Seek> {
     /// Cache of grain tables: maps GT sector number → Vec of GTE values.
     /// Avoids redundant seeks for repeated grain reads within the same GT.
     gt_cache: HashMap<u32, Vec<u32>>,
+    /// When `true`, a read whose primary grain-table pointer is unusable (out of
+    /// bounds) falls back to the redundant grain directory. Opt-in recovery mode.
+    rgd_fallback: bool,
 }
 
 /// Maximum bytes read from an embedded descriptor (guards against crafted images).
@@ -385,6 +388,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             rgd_offset: hdr.rgd_offset,
             gd_entry_count: num_gts as usize,
             gt_cache: HashMap::new(),
+            rgd_fallback: false,
         })
     }
 
@@ -794,6 +798,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             rgd_offset: 0,
             gd_entry_count: 0,
             gt_cache: HashMap::new(),
+            rgd_fallback: false,
         })
     }
 
@@ -832,6 +837,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             rgd_offset: 0,
             gd_entry_count: 0,
             gt_cache: HashMap::new(),
+            rgd_fallback: false,
         })
     }
 
@@ -1070,6 +1076,64 @@ impl<R: Read + Seek> VmdkReader<R> {
         self.gt_cache.len()
     }
 
+    /// Enable opt-in RGD fallback: a read whose primary grain-table pointer is out of
+    /// bounds is resolved through the redundant grain directory instead, recovering
+    /// data from a damaged primary GD that `qemu-img` would simply fail on.
+    pub fn enable_rgd_fallback(&mut self) {
+        self.rgd_fallback = true;
+    }
+
+    /// Resolve the grain-table sector for `gd_idx`, preferring the primary pointer and
+    /// falling back to the redundant grain directory when the primary is unusable.
+    /// Returns the primary pointer unchanged when no better candidate exists, so the
+    /// non-fallback error/sparse behaviour is preserved.
+    fn resilient_gt_sector(
+        &mut self,
+        gd_idx: usize,
+        primary: u32,
+        num_gtes_per_gt: u64,
+    ) -> io::Result<u32> {
+        let file_len = self.inner.seek(SeekFrom::End(0))?;
+        let gt_byte_len = num_gtes_per_gt * 4;
+        let usable = |sec: u32| {
+            sec != 0
+                && u64::from(sec)
+                    .saturating_mul(SECTOR_SIZE)
+                    .saturating_add(gt_byte_len)
+                    <= file_len
+        };
+        if usable(primary) {
+            return Ok(primary);
+        }
+        let rgd = self.rgd_dir_entry(gd_idx, file_len)?;
+        if usable(rgd) {
+            return Ok(rgd);
+        }
+        Ok(primary)
+    }
+
+    /// Read entry `gd_idx` from the redundant grain directory, or 0 if the RGD is
+    /// absent or the entry itself would fall outside the file.
+    fn rgd_dir_entry(&mut self, gd_idx: usize, file_len: u64) -> io::Result<u32> {
+        if self.rgd_offset == 0 || self.rgd_offset == crate::header::GD_AT_END {
+            return Ok(0);
+        }
+        if gd_idx >= self.gd_entry_count {
+            return Ok(0);
+        }
+        let entry_byte = self
+            .rgd_offset
+            .saturating_mul(SECTOR_SIZE)
+            .saturating_add(gd_idx as u64 * 4);
+        if entry_byte.saturating_add(4) > file_len {
+            return Ok(0);
+        }
+        self.inner.seek(SeekFrom::Start(entry_byte))?;
+        let mut b = [0u8; 4];
+        self.inner.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
     /// Resolve `virtual_offset` to a [`GrainLookup`] describing where to find the data.
     fn grain_location(&mut self, virtual_offset: u64) -> io::Result<GrainLookup> {
         // Dispatch seSparse separately: nibble-typed, bit-rotated 8-byte grain entries.
@@ -1114,7 +1178,15 @@ impl<R: Read + Seek> VmdkReader<R> {
             };
         }
 
-        let (gt_sector, gte_idx, offset_in_grain, compressed, grain_size_bytes, num_gtes_per_gt) = {
+        let (
+            gd_idx,
+            gt_sector,
+            gte_idx,
+            offset_in_grain,
+            compressed,
+            grain_size_bytes,
+            num_gtes_per_gt,
+        ) = {
             let FormatState::Sparse {
                 grain_dir,
                 grain_size_bytes,
@@ -1130,6 +1202,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             let gte_idx = grain_idx % num_gtes_per_gt;
             let gt_sector = grain_dir.get(gd_idx).copied().unwrap_or(0);
             (
+                gd_idx,
                 gt_sector,
                 gte_idx,
                 offset_in_grain,
@@ -1137,6 +1210,13 @@ impl<R: Read + Seek> VmdkReader<R> {
                 *grain_size_bytes,
                 *num_gtes_per_gt,
             )
+        };
+        // Recovery mode: if the primary grain-table pointer is unusable, resolve it
+        // through the redundant grain directory instead.
+        let gt_sector = if self.rgd_fallback {
+            self.resilient_gt_sector(gd_idx, gt_sector, num_gtes_per_gt)?
+        } else {
+            gt_sector
         };
         if gt_sector == 0 {
             return Ok(GrainLookup::Sparse);
@@ -1319,6 +1399,7 @@ impl VmdkFileReader {
                         rgd_offset: 0,
                         gd_entry_count: 0,
                         gt_cache: HashMap::new(),
+                        rgd_fallback: false,
                     })
                 }
                 // ESXi sparse formats: SPARSE/VMFSSPARSE extent type — binary VMDK4 or COWD.
@@ -1343,6 +1424,7 @@ impl VmdkFileReader {
                         rgd_offset: 0,
                         gd_entry_count: 0,
                         gt_cache: HashMap::new(),
+                        rgd_fallback: false,
                     })
                 }
                 // seSparse: a single binary extent whose CAFEBABE magic selects the reader.
@@ -1379,6 +1461,7 @@ impl VmdkFileReader {
                             rgd_offset: 0,
                             gd_entry_count: 0,
                             gt_cache: HashMap::new(),
+                            rgd_fallback: false,
                         })
                     } else if !desc.sparse_extents.is_empty() {
                         let multi = MultiSparseReader::open(dir, &desc.sparse_extents)?;
@@ -1401,6 +1484,7 @@ impl VmdkFileReader {
                             rgd_offset: 0,
                             gd_entry_count: 0,
                             gt_cache: HashMap::new(),
+                            rgd_fallback: false,
                         })
                     } else {
                         Err(VmdkError::InvalidGeometry(
@@ -1435,6 +1519,7 @@ impl<R: Read + Seek + Send + 'static> VmdkReader<R> {
             rgd_offset: self.rgd_offset,
             gd_entry_count: self.gd_entry_count,
             gt_cache: self.gt_cache,
+            rgd_fallback: self.rgd_fallback,
         }
     }
 }
