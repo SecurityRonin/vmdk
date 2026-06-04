@@ -3094,6 +3094,26 @@ mod tests {
     }
 
     #[test]
+    fn iter_allocated_grains_recovers_lost_primary_gte() {
+        // A grain whose primary GT entry is lost should be listed by the allocation
+        // scan under recovery (consistent with dump/hash --recover being able to read it).
+        let vmdk = two_copy_vmdk_with_lost_primary_gte();
+        {
+            let mut r = VmdkReader::open(Cursor::new(vmdk.clone())).expect("open");
+            assert_eq!(
+                r.iter_allocated_grains().expect("scan").len(),
+                0,
+                "lost primary GTE is not listed without recovery"
+            );
+        }
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        r.enable_rgd_fallback();
+        let grains = r.iter_allocated_grains().expect("scan");
+        assert_eq!(grains.len(), 1, "lost GTE recovered from redundant GT");
+        assert_eq!(grains[0].start_lba, 0);
+    }
+
+    #[test]
     fn rgd_fallback_is_noop_on_healthy_image() {
         // Enabling fallback must not change reads on an intact image.
         let vmdk = test_sparse_vmdk(&[0xAB; 512]);
