@@ -1,9 +1,9 @@
 //! Emit a synthetic VMDK fixture to a file, for cross-validation against qemu-img.
 //!
-//! Usage: cargo run --example emit_fixture --features test-helpers -- <kind> <out_path>
+//! Usage: cargo run --example `emit_fixture` --features test-helpers -- <kind> <`out_path`>
 //! where <kind> is one of: cowd, sesparse
 //!
-//! The grain holds a recognisable pattern (bytes 0..grain_size) so that an
+//! The grain holds a recognisable pattern (bytes `0..grain_size`) so that an
 //! independent reader (qemu-img convert -O raw) can be diffed against this crate.
 
 use std::io::Write;

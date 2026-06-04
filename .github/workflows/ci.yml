@@ -77,7 +77,7 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz
       - run: cargo fuzz build
 
   secrets:
