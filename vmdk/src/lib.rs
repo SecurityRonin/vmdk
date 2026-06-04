@@ -402,21 +402,34 @@ impl<R: Read + Seek> VmdkReader<R> {
 
     /// Validate the redundant grain directory (RGD) against the primary GD.
     ///
-    /// Returns `Ok(true)` if both directories are present and identical,
-    /// `Ok(false)` if the RGD is absent or mismatches (indicating corruption),
-    /// and `Err(_)` on I/O failure.
+    /// Returns `Ok(true)` if both directories are present and the grain tables they
+    /// reference hold identical contents, `Ok(false)` if the RGD is absent or the
+    /// redundant copy diverges (indicating corruption), and `Err(_)` on I/O failure.
+    ///
+    /// VMDK stores the grain tables **twice** \u2014 the GD and RGD point to *separate*
+    /// copies — so a healthy image has differing directory pointer values. This check
+    /// therefore compares the grain-table **contents** each directory references, not
+    /// the directory pointers themselves (which would false-positive on every real
+    /// multi-copy image).
     ///
     /// For flat and COWD/seSparse formats (which have no RGD) this always returns `Ok(false)`.
     pub fn validate_rgd(&mut self) -> io::Result<bool> {
-        let (primary_gd, rgd_offset, gd_entry_count) = match &self.fmt {
-            FormatState::Sparse { grain_dir, .. } => {
-                (grain_dir.clone(), self.rgd_offset, self.gd_entry_count)
-            }
+        let (primary_gd, num_gtes_per_gt) = match &self.fmt {
+            FormatState::Sparse {
+                grain_dir,
+                num_gtes_per_gt,
+                ..
+            } => (grain_dir.clone(), *num_gtes_per_gt),
             _ => return Ok(false), // Flat/seSparse/COWD have no RGD
         };
+        let rgd_offset = self.rgd_offset;
         if rgd_offset == 0 || rgd_offset == crate::header::GD_AT_END {
             return Ok(false);
         }
+        let gd_entry_count = self.gd_entry_count;
+        let file_len = self.inner.seek(SeekFrom::End(0))?;
+
+        // Read the redundant grain directory (same width as the primary GD).
         let rgd_byte_offset = rgd_offset
             .checked_mul(SECTOR_SIZE)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "rgd_offset overflow"))?;
@@ -427,7 +440,44 @@ impl<R: Read + Seek> VmdkReader<R> {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
             .collect();
-        Ok(primary_gd == rgd)
+
+        // Compare the grain table each directory entry references.
+        let gt_byte_len = (num_gtes_per_gt * 4) as usize;
+        for i in 0..gd_entry_count {
+            let p = primary_gd.get(i).copied().unwrap_or(0);
+            let r = rgd.get(i).copied().unwrap_or(0);
+            if p == 0 && r == 0 {
+                continue; // both directories agree the region has no grain table
+            }
+            if (p == 0) != (r == 0) {
+                return Ok(false); // one has a grain table, the other does not
+            }
+            let pgt = self.read_grain_table_bytes(p, gt_byte_len, file_len)?;
+            let rgt = self.read_grain_table_bytes(r, gt_byte_len, file_len)?;
+            match (pgt, rgt) {
+                (Some(a), Some(b)) if a == b => {}
+                _ => return Ok(false), // out-of-bounds or divergent grain-table contents
+            }
+        }
+        Ok(true)
+    }
+
+    /// Read the `gt_byte_len` bytes of the grain table at `gt_sector`, or `None` if it
+    /// would fall outside the file (a dangling/out-of-bounds directory pointer).
+    fn read_grain_table_bytes(
+        &mut self,
+        gt_sector: u32,
+        gt_byte_len: usize,
+        file_len: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let gt_byte = u64::from(gt_sector) * SECTOR_SIZE;
+        if gt_byte.saturating_add(gt_byte_len as u64) > file_len {
+            return Ok(None);
+        }
+        self.inner.seek(SeekFrom::Start(gt_byte))?;
+        let mut buf = vec![0u8; gt_byte_len];
+        self.inner.read_exact(&mut buf)?;
+        Ok(Some(buf))
     }
 
     /// Analyse the primary grain directory against the redundant grain directory (RGD)
