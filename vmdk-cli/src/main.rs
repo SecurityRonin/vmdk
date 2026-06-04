@@ -367,6 +367,27 @@ fn cmd_hash(path: &std::path::Path) -> ExitCode {
 
 // ── verify ────────────────────────────────────────────────────────────────────
 
+/// Build the `RGD:` status line for `verify` from the redundant-GD recovery report.
+///
+/// `matches` is [`vmdk::VmdkReader::validate_rgd`]'s verdict; `rec` is the
+/// per-entry recovery analysis. Distinguishes a truly absent RGD from one that is
+/// present but diverges — and, when the primary GD is damaged, reports how much of
+/// it the RGD can recover (information qemu-img cannot provide).
+fn rgd_status_line(matches: bool, rec: &vmdk::GdRecoveryReport) -> String {
+    if !rec.has_rgd {
+        "RGD:     absent or not applicable".to_string()
+    } else if matches {
+        "RGD:     OK (matches primary GD)".to_string()
+    } else if rec.primary_damaged == 0 {
+        "RGD:     present; differs from primary GD (primary intact)".to_string()
+    } else {
+        format!(
+            "RGD:     primary GD damaged — {} of {} entries damaged, {} recoverable via RGD",
+            rec.primary_damaged, rec.total_entries, rec.recoverable_via_rgd
+        )
+    }
+}
+
 fn cmd_verify(path: &std::path::Path) -> ExitCode {
     let mut reader = match open(path) {
         Ok(r) => r,
@@ -378,8 +399,10 @@ fn cmd_verify(path: &std::path::Path) -> ExitCode {
     println!("Size:    {} bytes", fmt_commas(info.virtual_disk_size));
 
     match reader.validate_rgd() {
-        Ok(true) => println!("RGD:     OK (matches primary GD)"),
-        Ok(false) => println!("RGD:     absent or not applicable"),
+        Ok(matches) => {
+            let recovery = reader.grain_directory_recovery().unwrap_or_default();
+            println!("{}", rgd_status_line(matches, &recovery));
+        }
         Err(e) => println!("RGD:     ERROR — {e}"),
     }
 
@@ -554,7 +577,10 @@ mod tests {
         };
         let line = rgd_status_line(false, &rec);
         assert!(line.contains("2 of 5"), "reports damaged count: {line}");
-        assert!(line.contains("2 recoverable"), "reports recoverable count: {line}");
+        assert!(
+            line.contains("2 recoverable"),
+            "reports recoverable count: {line}"
+        );
     }
 
     #[test]
