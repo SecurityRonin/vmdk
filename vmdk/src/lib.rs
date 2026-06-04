@@ -1858,6 +1858,38 @@ mod tests {
     }
 
     #[test]
+    fn validate_rgd_true_for_real_two_copy_image() {
+        // minimal.vmdk (real qemu output) stores the grain tables twice — the GD and
+        // RGD point to SEPARATE copies, so their pointer values differ even though the
+        // image is healthy. A correct RGD check compares the GT *contents*, not the
+        // directory pointers.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/minimal.vmdk");
+        let bytes = std::fs::read(path).expect("read minimal.vmdk");
+        let mut r = VmdkReader::open(Cursor::new(bytes)).expect("open");
+        assert!(
+            r.validate_rgd().expect("validate_rgd"),
+            "healthy two-copy image: GD/RGD grain-table contents match"
+        );
+    }
+
+    #[test]
+    fn validate_rgd_false_when_redundant_gt_content_differs() {
+        // Corrupt the redundant grain table (minimal.vmdk keeps it at sector 22) so its
+        // content diverges from the primary GT (sector 27) — a real RGD mismatch.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/minimal.vmdk");
+        let mut bytes = std::fs::read(path).expect("read minimal.vmdk");
+        let rgt = 22 * 512;
+        for b in &mut bytes[rgt..rgt + 4] {
+            *b ^= 0xFF;
+        }
+        let mut r = VmdkReader::open(Cursor::new(bytes)).expect("open");
+        assert!(
+            !r.validate_rgd().expect("validate_rgd"),
+            "divergent redundant GT content must be flagged as a mismatch"
+        );
+    }
+
+    #[test]
     fn validate_rgd_returns_false_for_flat_format() {
         let vmdk = gd_at_end_stream_opt_vmdk(); // streamOptimized, no RGD
         let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
