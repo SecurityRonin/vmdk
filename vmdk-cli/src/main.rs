@@ -811,6 +811,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_recover_passes_on_recoverable_image() {
+        // An image whose primary GD pointer is damaged but RGD-recoverable: verify
+        // fails by default (corruption present) but passes with --recover, which
+        // confirms the image is fully readable through the redundant GD.
+        let dir = tempfile::tempdir().unwrap();
+        let mut vmdk = vmdk::testutil::test_sparse_vmdk(&[0xAB; 512]);
+        let gd = 21 * 512;
+        vmdk[gd..gd + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let p = dir.path().join("corrupt.vmdk");
+        std::fs::write(&p, &vmdk).unwrap();
+        assert!(
+            !is_success(cmd_verify(&p, false)),
+            "verify flags the corruption without recovery"
+        );
+        assert!(
+            is_success(cmd_verify(&p, true)),
+            "verify --recover confirms the image is readable via the RGD"
+        );
+    }
+
+    #[test]
     fn dump_recover_reads_through_damaged_primary_gd() {
         // A VMDK whose primary GD entry is corrupted (out of bounds) but whose RGD and
         // grain table are intact: `dump` fails by default, but `--recover` resolves the
