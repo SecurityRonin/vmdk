@@ -255,6 +255,9 @@ pub struct VmdkReader<R: Read + Seek> {
     /// When `true`, a read whose primary grain-table pointer is unusable (out of
     /// bounds) falls back to the redundant grain directory. Opt-in recovery mode.
     rgd_fallback: bool,
+    /// Count of grains resolved via the redundant grain directory in this reader's
+    /// lifetime (pointer- or entry-level recovery). Read with `rgd_recovery_count()`.
+    rgd_recovery_count: u64,
 }
 
 /// Maximum bytes read from an embedded descriptor (guards against crafted images).
@@ -389,6 +392,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             gd_entry_count: num_gts as usize,
             gt_cache: HashMap::new(),
             rgd_fallback: false,
+            rgd_recovery_count: 0,
         })
     }
 
@@ -799,6 +803,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             gd_entry_count: 0,
             gt_cache: HashMap::new(),
             rgd_fallback: false,
+            rgd_recovery_count: 0,
         })
     }
 
@@ -838,6 +843,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             gd_entry_count: 0,
             gt_cache: HashMap::new(),
             rgd_fallback: false,
+            rgd_recovery_count: 0,
         })
     }
 
@@ -1028,6 +1034,9 @@ impl<R: Read + Seek> VmdkReader<R> {
                 b
             };
 
+            // The whole grain table was recovered when fallback swapped in an RGD pointer.
+            let pointer_recovered =
+                self.rgd_fallback && gt_sector != primary_gt_sector && gt_sector != 0;
             for gte_idx in 0..num_gtes_per_gt as usize {
                 let mut gte = u32::from_le_bytes(
                     gt_bytes[gte_idx * 4..gte_idx * 4 + 4]
@@ -1035,6 +1044,7 @@ impl<R: Read + Seek> VmdkReader<R> {
                         .expect("4 bytes"),
                 );
                 // Recover a lost primary entry from the redundant grain table.
+                let mut entry_recovered = false;
                 if gte <= 1 {
                     if let Some(rgt) = &redundant_gt {
                         let rgte = u32::from_le_bytes(
@@ -1044,10 +1054,14 @@ impl<R: Read + Seek> VmdkReader<R> {
                         );
                         if rgte > 1 {
                             gte = rgte;
+                            entry_recovered = true;
                         }
                     }
                 }
                 if gte > 1 {
+                    if pointer_recovered || entry_recovered {
+                        self.rgd_recovery_count += 1;
+                    }
                     let grain_idx = gd_idx as u64 * num_gtes_per_gt + gte_idx as u64;
                     let start_lba = grain_idx * grain_sectors;
                     if start_lba < self.virtual_disk_size / SECTOR_SIZE {
@@ -1112,6 +1126,14 @@ impl<R: Read + Seek> VmdkReader<R> {
     /// data from a damaged primary GD that `qemu-img` would simply fail on.
     pub fn enable_rgd_fallback(&mut self) {
         self.rgd_fallback = true;
+    }
+
+    /// Number of grains resolved via the redundant grain directory so far (pointer- or
+    /// entry-level recovery). Zero on a healthy image; non-zero quantifies how much of a
+    /// damaged image was reconstructed from the RGD.
+    #[must_use]
+    pub fn rgd_recovery_count(&self) -> u64 {
+        self.rgd_recovery_count
     }
 
     /// Resolve the grain-table sector for `gd_idx`, preferring the primary pointer and
@@ -1291,11 +1313,14 @@ impl<R: Read + Seek> VmdkReader<R> {
         };
         // Recovery mode: if the primary grain-table pointer is unusable, resolve it
         // through the redundant grain directory instead.
+        let primary_gt_sector = gt_sector;
         let gt_sector = if self.rgd_fallback {
             self.resilient_gt_sector(gd_idx, gt_sector, num_gtes_per_gt)?
         } else {
             gt_sector
         };
+        // The grain table was recovered when fallback swapped in a different (RGD) pointer.
+        let mut from_rgd = self.rgd_fallback && gt_sector != primary_gt_sector && gt_sector != 0;
         if gt_sector == 0 {
             return Ok(GrainLookup::Sparse);
         }
@@ -1323,6 +1348,7 @@ impl<R: Read + Seek> VmdkReader<R> {
         let gte = if self.rgd_fallback && gte <= 1 {
             let rgd_gte = self.rgd_gte(gd_idx, gte_idx, num_gtes_per_gt)?;
             if rgd_gte > 1 {
+                from_rgd = true;
                 rgd_gte
             } else {
                 gte
@@ -1332,6 +1358,9 @@ impl<R: Read + Seek> VmdkReader<R> {
         };
         if gte <= 1 {
             return Ok(GrainLookup::Sparse); // sparse or explicitly-zeroed grain
+        }
+        if from_rgd {
+            self.rgd_recovery_count += 1;
         }
         if compressed {
             // GrainMarker layout: u64 LBA (8 bytes) + u32 dataSize (4 bytes) + data.
@@ -1491,6 +1520,7 @@ impl VmdkFileReader {
                         gd_entry_count: 0,
                         gt_cache: HashMap::new(),
                         rgd_fallback: false,
+                        rgd_recovery_count: 0,
                     })
                 }
                 // ESXi sparse formats: SPARSE/VMFSSPARSE extent type — binary VMDK4 or COWD.
@@ -1516,6 +1546,7 @@ impl VmdkFileReader {
                         gd_entry_count: 0,
                         gt_cache: HashMap::new(),
                         rgd_fallback: false,
+                        rgd_recovery_count: 0,
                     })
                 }
                 // seSparse: a single binary extent whose CAFEBABE magic selects the reader.
@@ -1553,6 +1584,7 @@ impl VmdkFileReader {
                             gd_entry_count: 0,
                             gt_cache: HashMap::new(),
                             rgd_fallback: false,
+                            rgd_recovery_count: 0,
                         })
                     } else if !desc.sparse_extents.is_empty() {
                         let multi = MultiSparseReader::open(dir, &desc.sparse_extents)?;
@@ -1576,6 +1608,7 @@ impl VmdkFileReader {
                             gd_entry_count: 0,
                             gt_cache: HashMap::new(),
                             rgd_fallback: false,
+                            rgd_recovery_count: 0,
                         })
                     } else {
                         Err(VmdkError::InvalidGeometry(
@@ -1611,6 +1644,7 @@ impl<R: Read + Seek + Send + 'static> VmdkReader<R> {
             gd_entry_count: self.gd_entry_count,
             gt_cache: self.gt_cache,
             rgd_fallback: self.rgd_fallback,
+            rgd_recovery_count: self.rgd_recovery_count,
         }
     }
 }
@@ -3172,7 +3206,11 @@ mod tests {
         assert_eq!(r.rgd_recovery_count(), 0);
         let mut buf = [0u8; 512];
         r.read_exact(&mut buf).expect("read");
-        assert_eq!(r.rgd_recovery_count(), 1, "one grain recovered via RGD pointer");
+        assert_eq!(
+            r.rgd_recovery_count(),
+            1,
+            "one grain recovered via RGD pointer"
+        );
     }
 
     #[test]
@@ -3183,7 +3221,11 @@ mod tests {
         r.enable_rgd_fallback();
         let mut buf = [0u8; 512];
         r.read_exact(&mut buf).expect("read");
-        assert_eq!(r.rgd_recovery_count(), 1, "one grain recovered via RGD entry");
+        assert_eq!(
+            r.rgd_recovery_count(),
+            1,
+            "one grain recovered via RGD entry"
+        );
     }
 
     #[test]
@@ -3193,7 +3235,11 @@ mod tests {
         r.enable_rgd_fallback();
         let mut buf = [0u8; 512];
         r.read_exact(&mut buf).expect("read");
-        assert_eq!(r.rgd_recovery_count(), 0, "healthy read uses the primary GD");
+        assert_eq!(
+            r.rgd_recovery_count(),
+            0,
+            "healthy read uses the primary GD"
+        );
     }
 
     #[test]
