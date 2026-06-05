@@ -584,7 +584,14 @@ impl<R: Read + Seek> VmdkReader<R> {
                 let grain_size_bytes = *grain_size_bytes;
                 let num_gtes_per_gt = *num_gtes_per_gt;
                 let gt_byte_len = num_gtes_per_gt * 4;
-                for &gt_sector in &grain_dir {
+                for (gd_idx, &primary_gt_sector) in grain_dir.iter().enumerate() {
+                    // Recovery mode: resolve a dangling primary GT pointer through the RGD,
+                    // so the report reflects integrity *after* recovery.
+                    let gt_sector = if self.rgd_fallback {
+                        self.resilient_gt_sector(gd_idx, primary_gt_sector, num_gtes_per_gt)?
+                    } else {
+                        primary_gt_sector
+                    };
                     if gt_sector == 0 {
                         continue;
                     }
