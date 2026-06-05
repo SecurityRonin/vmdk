@@ -3162,6 +3162,50 @@ mod tests {
     }
 
     #[test]
+    fn rgd_recovery_count_tracks_pointer_recovery() {
+        // Pointer-level recovery: a corrupt primary GD pointer counts one recovered grain.
+        let mut vmdk = test_sparse_vmdk(&[0xAB; 512]);
+        let gd_byte = 21 * 512;
+        vmdk[gd_byte..gd_byte + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        r.enable_rgd_fallback();
+        assert_eq!(r.rgd_recovery_count(), 0);
+        let mut buf = [0u8; 512];
+        r.read_exact(&mut buf).expect("read");
+        assert_eq!(r.rgd_recovery_count(), 1, "one grain recovered via RGD pointer");
+    }
+
+    #[test]
+    fn rgd_recovery_count_tracks_entry_recovery() {
+        // Content-level recovery: a lost primary GT entry counts one recovered grain.
+        let vmdk = two_copy_vmdk_with_lost_primary_gte();
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        r.enable_rgd_fallback();
+        let mut buf = [0u8; 512];
+        r.read_exact(&mut buf).expect("read");
+        assert_eq!(r.rgd_recovery_count(), 1, "one grain recovered via RGD entry");
+    }
+
+    #[test]
+    fn rgd_recovery_count_zero_on_healthy_image() {
+        let vmdk = test_sparse_vmdk(&[0xAB; 512]);
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        r.enable_rgd_fallback();
+        let mut buf = [0u8; 512];
+        r.read_exact(&mut buf).expect("read");
+        assert_eq!(r.rgd_recovery_count(), 0, "healthy read uses the primary GD");
+    }
+
+    #[test]
+    fn rgd_recovery_count_in_allocation_scan() {
+        let vmdk = two_copy_vmdk_with_lost_primary_gte();
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        r.enable_rgd_fallback();
+        let _ = r.iter_allocated_grains().expect("scan");
+        assert_eq!(r.rgd_recovery_count(), 1, "scan counts the recovered grain");
+    }
+
+    #[test]
     fn rgd_fallback_is_noop_on_healthy_image() {
         // Enabling fallback must not change reads on an intact image.
         let vmdk = test_sparse_vmdk(&[0xAB; 512]);
