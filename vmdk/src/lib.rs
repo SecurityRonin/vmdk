@@ -3252,6 +3252,26 @@ mod tests {
     }
 
     #[test]
+    fn check_integrity_recovers_gt_pointer_via_rgd() {
+        // A dangling primary GT pointer is flagged by integrity; under recovery it is
+        // resolved via the RGD, so verify --recover can confirm the image is readable.
+        let mut vmdk = test_sparse_vmdk(&[0xAB; 512]);
+        let gd_byte = 21 * 512;
+        vmdk[gd_byte..gd_byte + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        {
+            let mut r = VmdkReader::open(Cursor::new(vmdk.clone())).expect("open");
+            let rep = r.check_integrity().expect("integrity");
+            assert!(!rep.is_ok(), "dangling GT pointer flagged without recovery");
+            assert_eq!(rep.out_of_bounds_grain_tables, 1);
+        }
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        r.enable_rgd_fallback();
+        let rep = r.check_integrity().expect("integrity");
+        assert!(rep.is_ok(), "GT pointer recovered via RGD ⇒ integrity OK");
+        assert_eq!(rep.out_of_bounds_grain_tables, 0);
+    }
+
+    #[test]
     fn rgd_fallback_is_noop_on_healthy_image() {
         // Enabling fallback must not change reads on an intact image.
         let vmdk = test_sparse_vmdk(&[0xAB; 512]);
