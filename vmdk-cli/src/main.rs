@@ -573,6 +573,18 @@ mod tests {
     }
 
     #[test]
+    fn recovery_note_none_when_zero() {
+        assert!(recovery_note(0).is_none(), "no note when nothing was recovered");
+    }
+
+    #[test]
+    fn recovery_note_reports_count() {
+        let n = recovery_note(3).expect("note for non-zero count");
+        assert!(n.contains('3'), "reports the count: {n}");
+        assert!(n.to_lowercase().contains("redundant"), "mentions the RGD: {n}");
+    }
+
+    #[test]
     fn rgd_status_absent_when_no_rgd() {
         let rec = vmdk::GdRecoveryReport::default(); // has_rgd = false
         assert!(rgd_status_line(false, &rec).contains("absent or not applicable"));
