@@ -92,7 +92,12 @@ enum Command {
     },
 
     /// Verify structural integrity: RGD validation + allocation scan
-    Verify { path: PathBuf },
+    Verify {
+        path: PathBuf,
+        /// Recover via the redundant grain directory and report post-recovery integrity
+        #[arg(long)]
+        recover: bool,
+    },
 
     /// Byte-by-byte comparison of two VMDK virtual disks
     Diff {
@@ -441,11 +446,15 @@ fn rgd_status_line(matches: bool, rec: &vmdk::GdRecoveryReport) -> String {
     }
 }
 
-fn cmd_verify(path: &std::path::Path) -> ExitCode {
+fn cmd_verify(path: &std::path::Path, recover: bool) -> ExitCode {
     let mut reader = match open(path) {
         Ok(r) => r,
         Err(m) => return fail(m),
     };
+    if recover {
+        // Report integrity *after* resolving damaged pointers through the RGD.
+        reader.enable_rgd_fallback();
+    }
     let info = reader.info();
     println!("File:    {}", path.display());
     println!("Format:  {} v{}", info.disk_type, info.version);
@@ -496,6 +505,11 @@ fn cmd_verify(path: &std::path::Path) -> ExitCode {
         }
     }
 
+    if recover {
+        if let Some(note) = recovery_note(reader.rgd_recovery_count()) {
+            println!("{note}");
+        }
+    }
     if failed {
         println!("Status:  FAILED");
         return ExitCode::FAILURE;
@@ -578,7 +592,7 @@ fn main() -> ExitCode {
             recover,
         } => cmd_dump(path, output.as_deref(), *offset, *length, *hex, *recover),
         Command::Hash { path, recover } => cmd_hash(path, *recover),
-        Command::Verify { path } => cmd_verify(path),
+        Command::Verify { path, recover } => cmd_verify(path, *recover),
         Command::Diff { a, b } => cmd_diff(a, b),
     }
 }
@@ -683,7 +697,7 @@ mod tests {
         assert!(is_success(cmd_info(&p, false, true))); // --chain
         assert!(is_success(cmd_map(&p, false)));
         assert!(is_success(cmd_hash(&p, false)));
-        assert!(is_success(cmd_verify(&p)));
+        assert!(is_success(cmd_verify(&p, false)));
         assert!(is_success(cmd_dump(&p, None, 0, Some(64), false, false))); // stdout range
         assert!(is_success(cmd_dump(&p, None, 1024, Some(20), true, false))); // hex partial row
         assert!(is_success(cmd_diff(&p, &p))); // identical
@@ -711,7 +725,7 @@ mod tests {
             cmd_info(&garbage, false, true), // chain fallback open error
             cmd_map(&garbage, false),
             cmd_hash(&garbage, false),
-            cmd_verify(&garbage),
+            cmd_verify(&garbage, false),
             cmd_dump(&garbage, None, 0, None, false, false),
             cmd_diff(&garbage, &garbage),
         ] {
@@ -764,7 +778,7 @@ mod tests {
         let p = dir.path().join("trunc.vmdk");
         std::fs::write(&p, &d).unwrap();
         assert!(
-            !is_success(cmd_verify(&p)),
+            !is_success(cmd_verify(&p, false)),
             "truncated image fails integrity"
         );
     }
@@ -913,7 +927,7 @@ mod tests {
         assert!(!is_success(cmd_map(&p, false)), "dangling GT → map error");
         // validate_rgd + allocation scan both error → verify fails.
         assert!(
-            !is_success(cmd_verify(&p)),
+            !is_success(cmd_verify(&p, false)),
             "dangling RGD/GT → verify error"
         );
     }
