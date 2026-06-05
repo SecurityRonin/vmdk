@@ -3338,6 +3338,58 @@ mod tests {
     }
 
     #[test]
+    fn content_recovery_with_no_rgd_offset_reads_sparse() {
+        // Primary GT entry lost + no RGD: content recovery finds nothing, stays sparse.
+        // Exercises rgd_dir_entry (rgd_offset == 0) and rgd_gte (sector == 0) guards.
+        let mut vmdk = test_sparse_vmdk(&[0xAB; 512]);
+        vmdk[23 * 512..23 * 512 + 4].copy_from_slice(&0u32.to_le_bytes()); // primary GTE[0] = 0
+        vmdk[48..56].copy_from_slice(&0u64.to_le_bytes()); // rgd_offset = 0
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        r.enable_rgd_fallback();
+        let mut buf = [0xFFu8; 512];
+        r.read_exact(&mut buf).expect("read");
+        assert_eq!(buf, [0u8; 512]);
+    }
+
+    #[test]
+    fn fallback_with_out_of_bounds_rgd_offset_is_safe() {
+        // Corrupt primary GD + an rgd_offset that points past EOF: the RGD entry read is
+        // bounds-checked (rgd_dir_entry / read_redundant_gt return 0/None), no panic.
+        let mut vmdk = test_sparse_vmdk(&[0xAB; 512]);
+        vmdk[21 * 512..21 * 512 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        vmdk[48..56].copy_from_slice(&9_999_999u64.to_le_bytes());
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        r.enable_rgd_fallback();
+        let _ = r.iter_allocated_grains();
+    }
+
+    #[test]
+    fn fallback_scan_with_rgd_gt_past_eof_lists_primary() {
+        // RGD entry points to a grain table past EOF: read_redundant_gt rejects it, but
+        // the (valid) primary grain table is still scanned.
+        let mut vmdk = test_sparse_vmdk(&[0xAB; 512]);
+        vmdk[22 * 512..22 * 512 + 4].copy_from_slice(&9_999_999u32.to_le_bytes());
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        r.enable_rgd_fallback();
+        let grains = r.iter_allocated_grains().expect("scan");
+        assert_eq!(grains.len(), 1);
+    }
+
+    #[test]
+    fn content_recovery_with_rgd_gt_past_eof_reads_sparse() {
+        // Primary GT entry lost + the redundant GT pointer is past EOF: rgd_gte rejects
+        // it and the grain stays sparse (no panic, no out-of-bounds read).
+        let mut vmdk = test_sparse_vmdk(&[0xAB; 512]);
+        vmdk[23 * 512..23 * 512 + 4].copy_from_slice(&0u32.to_le_bytes());
+        vmdk[22 * 512..22 * 512 + 4].copy_from_slice(&9_999_999u32.to_le_bytes());
+        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
+        r.enable_rgd_fallback();
+        let mut buf = [0xFFu8; 512];
+        r.read_exact(&mut buf).expect("read");
+        assert_eq!(buf, [0u8; 512]);
+    }
+
+    #[test]
     fn rgd_fallback_is_noop_on_healthy_image() {
         // Enabling fallback must not change reads on an intact image.
         let vmdk = test_sparse_vmdk(&[0xAB; 512]);
