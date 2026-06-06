@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+mod bytes;
 mod chain;
 mod cowd;
 mod ddb;
@@ -292,10 +293,7 @@ impl<R: Read + Seek> VmdkReader<R> {
         let mut gd_bytes = vec![0u8; gd_byte_len as usize];
         reader.read_exact(&mut gd_bytes)?;
 
-        let grain_dir = gd_bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().expect("4-byte chunk from chunks_exact(4)")))
-            .collect();
+        let grain_dir = bytes::le_u32_table(&gd_bytes);
 
         diag::opened(
             desc.create_type.as_ref(),
@@ -330,6 +328,13 @@ impl<R: Read + Seek> VmdkReader<R> {
     /// Virtual disk size in bytes.
     pub fn virtual_disk_size(&self) -> u64 {
         self.virtual_disk_size
+    }
+
+    /// Seek to `offset` and read exactly `buf.len()` bytes — one home for the
+    /// pervasive seek-then-read idiom.
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.seek(SeekFrom::Start(offset))?;
+        self.inner.read_exact(buf)
     }
 
     /// `createType` from the embedded text descriptor (e.g. `"monolithicSparse"`).
@@ -533,9 +538,8 @@ impl<R: Read + Seek> VmdkReader<R> {
                     return Ok(false);
                 }
                 let gte_pos = u64::from(gt_sector) * SECTOR_SIZE + gte_idx * 4;
-                self.inner.seek(SeekFrom::Start(gte_pos))?;
                 let mut b = [0u8; 4];
-                self.inner.read_exact(&mut b)?;
+                self.read_exact_at(gte_pos, &mut b)?;
                 Ok(u32::from_le_bytes(b) > 1)
             }
             FormatState::SeSparse {
@@ -583,9 +587,8 @@ impl<R: Read + Seek> VmdkReader<R> {
         let gt_table_idx = gd_entry & sesparse::SE_GD_INDEX_MASK;
         let gt_sector = gt_offset_sectors + gt_table_idx * sesparse::SE_GT_SECTORS;
         let gte_pos = gt_sector * SECTOR_SIZE + gte_idx * 8;
-        self.inner.seek(SeekFrom::Start(gte_pos))?;
         let mut b = [0u8; 8];
-        self.inner.read_exact(&mut b)?;
+        self.read_exact_at(gte_pos, &mut b)?;
         Ok(Some(u64::from_le_bytes(b)))
     }
 
@@ -635,9 +638,8 @@ impl<R: Read + Seek> VmdkReader<R> {
                     let gt_table_idx = gd_entry & sesparse::SE_GD_INDEX_MASK;
                     let gt_sector = goff + gt_table_idx * sesparse::SE_GT_SECTORS;
                     let gt_bytes_len = sesparse::SE_GTES_PER_GT as usize * 8;
-                    self.inner.seek(SeekFrom::Start(gt_sector * SECTOR_SIZE))?;
                     let mut gt_bytes = vec![0u8; gt_bytes_len];
-                    self.inner.read_exact(&mut gt_bytes)?;
+                    self.read_exact_at(gt_sector * SECTOR_SIZE, &mut gt_bytes)?;
                     for gte_idx in 0..sesparse::SE_GTES_PER_GT as usize {
                         let gte = u64::from_le_bytes(
                             gt_bytes[gte_idx * 8..gte_idx * 8 + 8]
@@ -684,9 +686,8 @@ impl<R: Read + Seek> VmdkReader<R> {
             let gt_size = num_gtes_per_gt as usize * 4;
             let gt_bytes = {
                 let gt_byte_offset = u64::from(gt_sector) * SECTOR_SIZE;
-                self.inner.seek(SeekFrom::Start(gt_byte_offset))?;
                 let mut b = vec![0u8; gt_size];
-                self.inner.read_exact(&mut b)?;
+                self.read_exact_at(gt_byte_offset, &mut b)?;
                 b
             };
 
@@ -838,9 +839,8 @@ impl<R: Read + Seek> VmdkReader<R> {
         if entry_byte.saturating_add(4) > file_len {
             return Ok(0);
         }
-        self.inner.seek(SeekFrom::Start(entry_byte))?;
         let mut b = [0u8; 4];
-        self.inner.read_exact(&mut b)?;
+        self.read_exact_at(entry_byte, &mut b)?;
         Ok(u32::from_le_bytes(b))
     }
 
@@ -861,9 +861,8 @@ impl<R: Read + Seek> VmdkReader<R> {
         if gt_byte.saturating_add(gt_byte_len) > file_len {
             return Ok(None);
         }
-        self.inner.seek(SeekFrom::Start(gt_byte))?;
         let mut b = vec![0u8; gt_byte_len as usize];
-        self.inner.read_exact(&mut b)?;
+        self.read_exact_at(gt_byte, &mut b)?;
         Ok(Some(b))
     }
 
@@ -885,9 +884,8 @@ impl<R: Read + Seek> VmdkReader<R> {
         if entry_byte.saturating_add(4) > file_len {
             return Ok(0);
         }
-        self.inner.seek(SeekFrom::Start(entry_byte))?;
         let mut b = [0u8; 4];
-        self.inner.read_exact(&mut b)?;
+        self.read_exact_at(entry_byte, &mut b)?;
         Ok(u32::from_le_bytes(b))
     }
 
@@ -1005,10 +1003,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             let gt_size = num_gtes_per_gt as usize * 4;
             let mut gt_bytes = vec![0u8; gt_size];
             self.inner.read_exact(&mut gt_bytes)?;
-            let gt: Vec<u32> = gt_bytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
-                .collect();
+            let gt: Vec<u32> = bytes::le_u32_table(&gt_bytes);
             let gte = gt.get(gte_idx as usize).copied().unwrap_or(0);
             self.gt_cache.insert(gt_sector, gt);
             gte
@@ -1038,9 +1033,8 @@ impl<R: Read + Seek> VmdkReader<R> {
         if compressed {
             // GrainMarker layout: u64 LBA (8 bytes) + u32 dataSize (4 bytes) + data.
             let marker_offset = u64::from(gte) * SECTOR_SIZE;
-            self.inner.seek(SeekFrom::Start(marker_offset))?;
             let mut marker_hdr = [0u8; 12];
-            self.inner.read_exact(&mut marker_hdr)?;
+            self.read_exact_at(marker_offset, &mut marker_hdr)?;
             let data_size = u32::from_le_bytes(marker_hdr[8..12].try_into().expect("4 bytes"));
             // Cap data_size to prevent allocation amplification from crafted markers.
             // A legitimate compressed grain cannot expand to more than 64 KiB past the
@@ -1078,9 +1072,8 @@ impl<R: Read + Seek> VmdkReader<R> {
     ) -> io::Result<usize> {
         use flate2::read::ZlibDecoder;
 
-        self.inner.seek(SeekFrom::Start(data_offset))?;
         let mut compressed = vec![0u8; data_size as usize];
-        self.inner.read_exact(&mut compressed)?;
+        self.read_exact_at(data_offset, &mut compressed)?;
 
         let mut decoder = ZlibDecoder::new(compressed.as_slice());
         let mut grain_data = Vec::new();
