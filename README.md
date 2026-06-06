@@ -60,7 +60,7 @@ when clean and `1` on corruption, so it drops into a triage pipeline.
 
 ```toml
 [dependencies]
-vmdk = "0.3"
+vmdk = "0.4"
 ```
 
 ## Quick start
@@ -100,10 +100,10 @@ others give up on:
 | Snapshot / delta chain traversal | ✅ | ✅ |
 | **Recover data behind a damaged primary GD** (redundant-GD fallback) | ✗ | ✅ |
 | **Recover an individual lost grain-table entry** from the redundant copy | ✗ | ✅ |
-| Redundant-GD validation (grain-table *contents*, not pointers) | ✗ | ✅ |
-| Structural integrity scan (dangling GD/GT/grain pointers) | ✗ | ✅ |
+| Redundant-GD validation (grain-table *contents*, not pointers) | ✗ | ✅ via `vmdk-forensic` |
+| Structural integrity scan (dangling GD/GT/grain pointers) | ✗ | ✅ via `vmdk-forensic` |
 | `ddb.*` disk database (adapter, geometry, UUID, tools/HW version) | discarded | ✅ |
-| Header provenance — unclean-shutdown flag, FTP-ASCII-mangling check | ✗ | ✅ |
+| Header provenance — unclean-shutdown flag, FTP-ASCII-mangling check | ✗ | ✅ via `vmdk-forensic` |
 | Change Block Tracking (`-ctk`) reference | ✗ | ✅ |
 | `longContentID` resolution (the `CID == 0xFFFFFFFE` sentinel) | ✗ | ✅ |
 | Raw Device Mapping (`VMFSRDM`) extent enumeration | ✗ | ✅ |
@@ -143,13 +143,6 @@ use std::io::Read;
 
 let mut disk = VmdkReader::open(std::fs::File::open("damaged.vmdk")?)?;
 
-// Triage: how much of the primary grain directory is recoverable via the RGD?
-let report = disk.grain_directory_recovery()?;
-println!(
-    "{} entries, {} damaged, {} recoverable via RGD",
-    report.total_entries, report.primary_damaged, report.recoverable_via_rgd,
-);
-
 // Opt in to recovery, then read normally — damaged pointers resolve through the RGD.
 disk.enable_rgd_fallback();
 let mut buf = vec![0u8; 1 << 20];
@@ -158,8 +151,10 @@ println!("recovered {} grain(s) via the RGD", disk.rgd_recovery_count());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Recovery is opt-in and never changes a healthy read; without it a dangling
-pointer simply errors (the safe default).
+Recovery is opt-in and never changes a healthy read; without it a dangling pointer
+simply errors (the safe default). To *triage* a damaged image first — how much of
+the primary grain directory the RGD can recover, plus tamper/anomaly detection — use
+the companion [`vmdk-forensic`](https://crates.io/crates/vmdk-forensic) crate.
 
 ## Forensic metadata
 
@@ -177,14 +172,14 @@ println!("geometry:  {:?}", ddb.geometry);      // CHS cylinders/heads/sectors
 println!("disk UUID: {:?}", ddb.uuid);
 println!("HW / tools: {:?} / {:?}", ddb.virtual_hw_version, ddb.tools_version);
 
-if let Some(p) = disk.header_provenance()? {
-    println!("unclean shutdown:  {}", p.unclean_shutdown);    // crash / live image
-    println!("newline check ok:  {}", p.newline_check_intact); // false ⇒ FTP-mangled
-}
 println!("CBT file:   {:?}", disk.change_track_path());       // -ctk.vmdk reference
 println!("content ID: {}",  disk.effective_content_id());     // resolves longContentID
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+Header provenance (unclean-shutdown flag, FTP-ASCII-mangling check) and the integrity
+/ anomaly analysis live in the [`vmdk-forensic`](https://crates.io/crates/vmdk-forensic)
+companion crate — see [Related](#related).
 
 ## API highlights
 
@@ -252,6 +247,12 @@ formats the same way — a pure `Read + Seek` over the decoded sector stream:
 | [`vhd`](https://github.com/SecurityRonin/vhd) | Legacy VHD (Virtual PC / Hyper-V Gen-1) |
 | [`qcow2`](https://github.com/SecurityRonin/qcow2) | QEMU / KVM QCOW2 |
 | [`dd`](https://github.com/SecurityRonin/dd) | Raw / flat / dd images |
+
+Audit a VMDK for tampering, corruption, and recoverability with its forensic sibling:
+
+| Crate | Role |
+|---|---|
+| [`vmdk-forensic`](https://github.com/SecurityRonin/vmdk) | VMDK integrity analysis — RGD adjudication, dangling-pointer scan, recovery triage, header provenance, graded anomalies |
 
 Once you have the bytes, these parsers analyse the partition layout inside:
 
