@@ -2234,20 +2234,31 @@ mod tests {
         }
     }
 
+    /// Locate `qemu-img` portably (PATH-style common locations) for cross-validation
+    /// tests; `None` (→ skip) only when it is genuinely not installed.
+    fn qemu_img() -> Option<&'static str> {
+        [
+            "/opt/homebrew/bin/qemu-img",
+            "/usr/bin/qemu-img",
+            "/usr/local/bin/qemu-img",
+        ]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+    }
+
     #[test]
     fn reads_match_qemu_raw_convert() {
         use std::fs::File;
-        const QEMU_IMG: &str = "/opt/homebrew/bin/qemu-img";
-        if !std::path::Path::new(QEMU_IMG).exists() {
+        let Some(qemu_img) = qemu_img() else {
             return;
-        }
+        };
         let tmp = tempfile::tempdir().expect("tempdir");
         let size: usize = 1 << 20;
         let raw_data: Vec<u8> = (0..size).map(|i| (i ^ (i >> 8)) as u8).collect();
         let raw_path = tmp.path().join("source.raw");
         std::fs::write(&raw_path, &raw_data).expect("write raw");
         let vmdk_path = tmp.path().join("test.vmdk");
-        let status = std::process::Command::new(QEMU_IMG)
+        let status = std::process::Command::new(qemu_img)
             .args([
                 "convert",
                 "-O",
@@ -2278,10 +2289,9 @@ mod tests {
     #[test]
     fn corpus_dfvfs_ext2_vmdk_reads_match_qemu_raw_convert() {
         use std::fs::File;
-        const QEMU_IMG: &str = "/opt/homebrew/bin/qemu-img";
-        if !std::path::Path::new(QEMU_IMG).exists() {
+        let Some(qemu_img) = qemu_img() else {
             return;
-        }
+        };
         let corpus =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/dfvfs_ext2.vmdk");
         if !corpus.exists() {
@@ -2289,7 +2299,7 @@ mod tests {
         }
         let tmp = tempfile::tempdir().expect("tempdir");
         let raw_path = tmp.path().join("ext2.raw");
-        let ok = std::process::Command::new(QEMU_IMG)
+        let ok = std::process::Command::new(qemu_img)
             .args([
                 "convert",
                 "-O",
@@ -2329,10 +2339,9 @@ mod tests {
     #[test]
     fn corpus_minimal_vmdk_reads_match_qemu_raw_convert() {
         use std::fs::File;
-        const QEMU_IMG: &str = "/opt/homebrew/bin/qemu-img";
-        if !std::path::Path::new(QEMU_IMG).exists() {
+        let Some(qemu_img) = qemu_img() else {
             return;
-        }
+        };
         let corpus =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/minimal.vmdk");
         if !corpus.exists() {
@@ -2340,7 +2349,7 @@ mod tests {
         }
         let tmp = tempfile::tempdir().expect("tempdir");
         let raw_path = tmp.path().join("minimal.raw");
-        let ok = std::process::Command::new(QEMU_IMG)
+        let ok = std::process::Command::new(qemu_img)
             .args([
                 "convert",
                 "-O",
