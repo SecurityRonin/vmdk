@@ -16,8 +16,8 @@ mod ddb;
 mod descriptor;
 pub(crate) mod error;
 mod flat;
-mod header;
-mod sesparse;
+pub mod header;
+pub mod sesparse;
 mod sparse_multi;
 
 pub use chain::VmdkChainReader;

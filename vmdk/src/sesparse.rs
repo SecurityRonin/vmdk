@@ -51,7 +51,7 @@ pub fn se_gte_grain_index(gte: u64) -> u64 {
 }
 
 /// Parsed seSparse constant header (first 512 bytes of the extent file).
-pub(crate) struct SeConstHeader {
+pub struct SeConstHeader {
     pub capacity: u64,      // virtual disk size in sectors
     pub grain_size: u64,    // must be 8
     pub gd_offset: u64,     // grain directory sector offset
