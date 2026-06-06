@@ -27,6 +27,10 @@ pub struct VmdkChainReader {
     layers: Vec<VmdkFileReader>,
     virtual_disk_size: u64,
     pos: u64,
+    /// Smallest non-zero grain size (bytes) across the layers; reads are clamped
+    /// to this boundary so a sparse grain can't zero-mask a following allocated
+    /// grain. `0` for an all-flat chain, where no clamping is needed.
+    clamp_bytes: u64,
 }
 
 impl VmdkChainReader {
@@ -79,10 +83,17 @@ impl VmdkChainReader {
         let virtual_disk_size = layers
             .first()
             .map_or(0, super::VmdkReader::virtual_disk_size);
+        let clamp_bytes = layers
+            .iter()
+            .map(|l| l.info().grain_size_bytes)
+            .filter(|&g| g > 0)
+            .min()
+            .unwrap_or(0);
         Ok(VmdkChainReader {
             layers,
             virtual_disk_size,
             pos: 0,
+            clamp_bytes,
         })
     }
 
@@ -105,7 +116,13 @@ impl Read for VmdkChainReader {
         // Try each layer from newest to oldest. Read from the first layer that has
         // data at this position. Sparse reads return zeros but we detect them by
         // checking is_allocated; if a layer doesn't have data, try the next.
-        let to_read = buf.len().min((self.virtual_disk_size - self.pos) as usize);
+        let mut to_read = buf.len().min((self.virtual_disk_size - self.pos) as usize);
+        if self.clamp_bytes > 0 {
+            // Clamp to a single grain so a sparse grain cannot zero-mask an
+            // allocated grain that falls within the same read.
+            let remaining_in_grain = (self.clamp_bytes - self.pos % self.clamp_bytes) as usize;
+            to_read = to_read.min(remaining_in_grain);
+        }
         let lba = self.pos / 512;
 
         for layer in &mut self.layers {
