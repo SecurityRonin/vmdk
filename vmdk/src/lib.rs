@@ -2344,7 +2344,7 @@ mod tests {
         vmdk[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(matches!(
             VmdkReader::open(Cursor::new(vmdk)),
-            Err(VmdkError::InvalidGeometry(_))
+            Err(VmdkError::GeometryOverflow { field: "capacity" })
         ));
     }
 

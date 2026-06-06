@@ -165,7 +165,7 @@ mod tests {
         h[20..28].copy_from_slice(&4u64.to_le_bytes()); // < 8
         assert!(matches!(
             SparseExtentHeader::parse(&h),
-            Err(VmdkError::InvalidGeometry(_))
+            Err(VmdkError::FieldOutOfRange { field: "grain_size", value: 4, .. })
         ));
     }
 
@@ -175,7 +175,7 @@ mod tests {
         h[44..48].copy_from_slice(&0u32.to_le_bytes());
         assert!(matches!(
             SparseExtentHeader::parse(&h),
-            Err(VmdkError::InvalidGeometry(_))
+            Err(VmdkError::FieldOutOfRange { field: "num_gtes_per_gt", value: 0, .. })
         ));
     }
 
@@ -189,7 +189,7 @@ mod tests {
         h[44..48].copy_from_slice(&513u32.to_le_bytes());
         assert!(matches!(
             SparseExtentHeader::parse(&h),
-            Err(VmdkError::InvalidGeometry(_))
+            Err(VmdkError::FieldOutOfRange { field: "num_gtes_per_gt", value: 513, .. })
         ));
 
         // The extreme crafted value must also be rejected, not allocated.
@@ -197,7 +197,7 @@ mod tests {
         h[44..48].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         assert!(matches!(
             SparseExtentHeader::parse(&h),
-            Err(VmdkError::InvalidGeometry(_))
+            Err(VmdkError::FieldOutOfRange { field: "num_gtes_per_gt", value: 0xFFFF_FFFF, .. })
         ));
     }
 
