@@ -570,6 +570,7 @@ impl<R: Read + Seek> VmdkIntegrity<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forensicnomicon::report::Severity;
     use std::io::Cursor;
     use vmdk::testutil::{test_sesparse_vmdk, test_sparse_vmdk};
 
@@ -633,7 +634,7 @@ mod tests {
         assert!(
             anomalies
                 .iter()
-                .any(|x| matches!(x.kind, AnomalyKind::RedundantGdMismatch)),
+                .any(|x| x.code.as_ref() == "VMDK-RGD-MISMATCH"),
             "expected an RGD mismatch anomaly, got: {anomalies:?}"
         );
     }
@@ -743,7 +744,7 @@ mod tests {
         let anomalies = a.analyse().expect("io");
         assert!(anomalies
             .iter()
-            .any(|x| matches!(x.kind, AnomalyKind::UncleanShutdown)));
+            .any(|x| x.code.as_ref() == "VMDK-UNCLEAN-SHUTDOWN"));
     }
 
     #[test]
@@ -755,10 +756,10 @@ mod tests {
             .analyse()
             .expect("io")
             .into_iter()
-            .map(|x| x.kind)
+            .map(|x| x.code)
             .collect();
-        assert!(k.contains(&AnomalyKind::DanglingGrainTable));
-        assert!(k.contains(&AnomalyKind::PrimaryGdRecoverableViaRgd));
+        assert!(k.iter().any(|c| c.as_ref() == "VMDK-DANGLING-GT"));
+        assert!(k.iter().any(|c| c.as_ref() == "VMDK-PRIMARY-GD-RECOVERABLE"));
         // first finding is the most severe (Error sorts before Warning)
     }
 
@@ -772,9 +773,9 @@ mod tests {
             .analyse()
             .expect("io")
             .into_iter()
-            .map(|x| x.kind)
+            .map(|x| x.code)
             .collect();
-        assert!(k.contains(&AnomalyKind::PrimaryGdUnrecoverable));
+        assert!(k.iter().any(|c| c.as_ref() == "VMDK-PRIMARY-GD-UNRECOVERABLE"));
     }
 
     #[test]
@@ -818,9 +819,9 @@ mod tests {
             .analyse()
             .expect("io")
             .into_iter()
-            .map(|x| x.kind)
+            .map(|x| x.code)
             .collect();
-        assert!(k.contains(&AnomalyKind::FtpAsciiMangled));
+        assert!(k.iter().any(|c| c.as_ref() == "VMDK-FTP-ASCII-MANGLED"));
     }
 
     #[test]
@@ -832,9 +833,9 @@ mod tests {
             .analyse()
             .expect("io")
             .into_iter()
-            .map(|x| x.kind)
+            .map(|x| x.code)
             .collect();
-        assert!(k.contains(&AnomalyKind::DanglingGrain));
+        assert!(k.iter().any(|c| c.as_ref() == "VMDK-DANGLING-GRAIN"));
     }
 
     #[test]
@@ -917,6 +918,6 @@ mod tests {
         let v = test_sparse_vmdk(&[0xAB; 512]);
         let mut a = VmdkIntegrity::new(Cursor::new(v));
         let anomalies = a.analyse().expect("io");
-        assert!(anomalies.iter().all(|x| x.severity != Severity::Error));
+        assert!(anomalies.iter().all(|x| x.severity < Some(Severity::High)));
     }
 }
