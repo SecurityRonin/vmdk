@@ -910,7 +910,13 @@ impl VmdkFileReader {
                 }
                 // custom: an arbitrary extent mix — route by which extents are present.
                 "custom" => {
-                    if !desc.extents.is_empty() {
+                    if !desc.extents.is_empty() && !desc.sparse_extents.is_empty() {
+                        // Mixed flat+sparse under one custom createType is not composed;
+                        // fail loud rather than silently dropping the sparse extents.
+                        Err(VmdkError::MalformedDescriptor(
+                            "custom createType mixes flat and sparse extents, which is not supported",
+                        ))
+                    } else if !desc.extents.is_empty() {
                         let multi = MultiExtentReader::open(dir, &desc.extents)?;
                         let virtual_disk_size = desc
                             .capacity_sectors
