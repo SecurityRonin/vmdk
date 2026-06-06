@@ -42,13 +42,24 @@ impl<R: Read + Seek> VmdkReader<R> {
 
     /// Resolve `virtual_offset` to a [`GrainLookup`] describing where to find the data.
     pub(crate) fn grain_location(&mut self, virtual_offset: u64) -> io::Result<GrainLookup> {
-        // Dispatch seSparse separately: nibble-typed, bit-rotated 8-byte grain entries.
-        if let FormatState::SeSparse {
+        // seSparse uses nibble-typed, bit-rotated 8-byte grain entries — resolved separately.
+        if matches!(self.fmt, FormatState::SeSparse { .. }) {
+            return self.grain_location_sesparse(virtual_offset);
+        }
+        self.grain_location_sparse(virtual_offset)
+    }
+
+    /// Resolve a virtual offset for a seSparse (VMFS6) extent.
+    fn grain_location_sesparse(&mut self, virtual_offset: u64) -> io::Result<GrainLookup> {
+        let FormatState::SeSparse {
             grain_dir,
             grain_size_bytes,
             gt_offset_sectors,
             grains_offset_sectors,
         } = &self.fmt
+        else {
+            return Ok(GrainLookup::Sparse); // dispatched only for seSparse
+        };
         {
             let grain_size_bytes = *grain_size_bytes;
             let grain_sectors = grain_size_bytes / SECTOR_SIZE;
@@ -63,7 +74,7 @@ impl<R: Read + Seek> VmdkReader<R> {
             let Some(gte) = self.se_read_gte(gd_entry, gt_off, gte_idx)? else {
                 return Ok(GrainLookup::Sparse);
             };
-            return match gte & sesparse::SE_GTE_TYPE_MASK {
+            match gte & sesparse::SE_GTE_TYPE_MASK {
                 // Unallocated: the whole entry must be zero (already handled by se_read_gte
                 // for the GD level; a zero GTE here means a sparse grain within an allocated GT).
                 0 if gte == 0 => Ok(GrainLookup::Sparse),
@@ -81,9 +92,12 @@ impl<R: Read + Seek> VmdkReader<R> {
                     io::ErrorKind::InvalidData,
                     "seSparse grain entry has unsupported type nibble",
                 )),
-            };
+            }
         }
+    }
 
+    /// Resolve a virtual offset for a VMDK4 sparse / streamOptimized extent.
+    fn grain_location_sparse(&mut self, virtual_offset: u64) -> io::Result<GrainLookup> {
         let (
             gd_idx,
             gt_sector,
