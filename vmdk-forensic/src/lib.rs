@@ -6,18 +6,24 @@
 //! and reports the redundant-grain-directory, dangling-pointer, recovery, and header
 //! provenance findings that `qemu-img` and `libvmdk` discard.
 //!
+//! `analyse()` returns canonical [`forensicnomicon::report::Finding`]s, so VMDK
+//! findings aggregate alongside every other SecurityRonin analyzer.
+//!
 //! ```no_run
-//! use vmdk_forensic::{VmdkIntegrity, Severity};
+//! use vmdk_forensic::VmdkIntegrity;
+//! use forensicnomicon::report::Severity;
 //! let mut a = VmdkIntegrity::new(std::fs::File::open("disk.vmdk")?);
-//! for anomaly in a.analyse()? {
-//!     if anomaly.severity >= Severity::Warning {
-//!         println!("[{:?}] {}", anomaly.severity, anomaly.detail);
+//! for finding in a.analyse()? {
+//!     if finding.severity >= Some(Severity::Medium) {
+//!         println!("[{:?}] {} — {}", finding.severity, finding.code, finding.note);
 //!     }
 //! }
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
 use std::io::{self, Read, Seek, SeekFrom};
+
+use forensicnomicon::report::{Category, Finding, Severity};
 
 use vmdk::header::{self, SparseExtentHeader};
 use vmdk::sesparse::{self, SeConstHeader};
@@ -95,19 +101,10 @@ pub struct HeaderProvenance {
     pub has_markers: bool,
 }
 
-/// Severity of a forensic finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Severity {
-    /// Informational — provenance or benign state.
-    Info,
-    /// Suspicious — may indicate corruption or recoverable damage.
-    Warning,
-    /// Structural defect — truncation, tampering, or unreadable region.
-    Error,
-}
-
-/// The kind of a forensic finding.
+/// The kind of a forensic finding. Each variant carries the data its canonical
+/// [`Finding`] needs; severity, code, note, category and MITRE refs are derived
+/// from it via the [`Observation`](forensicnomicon::report::Observation) impl
+/// below, so detection sites never spell out presentation logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AnomalyKind {
@@ -117,26 +114,134 @@ pub enum AnomalyKind {
     FtpAsciiMangled,
     /// Redundant grain directory diverges from the primary (grain-table contents differ).
     RedundantGdMismatch,
-    /// One or more grain-table pointers fall beyond end-of-file.
-    DanglingGrainTable,
-    /// One or more grain pointers fall beyond end-of-file.
-    DanglingGrain,
     /// The primary grain directory is damaged but (partly) recoverable via the RGD.
-    PrimaryGdRecoverableViaRgd,
+    PrimaryGdRecoverableViaRgd {
+        /// Damaged primary GD entries.
+        damaged: usize,
+        /// Total GD entries.
+        total: usize,
+        /// Entries recoverable from the redundant copy.
+        recoverable: usize,
+    },
     /// The primary grain directory is damaged with no RGD recovery available.
-    PrimaryGdUnrecoverable,
+    PrimaryGdUnrecoverable {
+        /// Damaged entries with no redundant copy.
+        unrecoverable: usize,
+    },
+    /// One or more grain-table pointers fall beyond end-of-file.
+    DanglingGrainTable {
+        /// Out-of-bounds grain-table pointers.
+        count: u64,
+    },
+    /// One or more grain pointers fall beyond end-of-file.
+    DanglingGrain {
+        /// Out-of-bounds grain pointers.
+        count: u64,
+    },
 }
 
-/// A single forensic finding with its severity and a human-readable explanation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct VmdkAnomaly {
-    /// How serious the finding is.
-    pub severity: Severity,
-    /// What was found.
-    pub kind: AnomalyKind,
-    /// Forensic significance — what it means for the examiner.
-    pub detail: String,
+impl forensicnomicon::report::Observation for AnomalyKind {
+    fn severity(&self) -> Option<Severity> {
+        use AnomalyKind::{
+            DanglingGrain, DanglingGrainTable, FtpAsciiMangled, PrimaryGdRecoverableViaRgd,
+            PrimaryGdUnrecoverable, RedundantGdMismatch, UncleanShutdown,
+        };
+        Some(match self {
+            UncleanShutdown => Severity::Low,
+            PrimaryGdRecoverableViaRgd { .. } => Severity::Medium,
+            FtpAsciiMangled
+            | RedundantGdMismatch
+            | PrimaryGdUnrecoverable { .. }
+            | DanglingGrainTable { .. }
+            | DanglingGrain { .. } => Severity::High,
+        })
+    }
+
+    fn category(&self) -> Category {
+        match self {
+            AnomalyKind::DanglingGrainTable { .. } | AnomalyKind::DanglingGrain { .. } => {
+                Category::Structure
+            }
+            _ => Category::Integrity,
+        }
+    }
+
+    fn code(&self) -> &'static str {
+        use AnomalyKind::{
+            DanglingGrain, DanglingGrainTable, FtpAsciiMangled, PrimaryGdRecoverableViaRgd,
+            PrimaryGdUnrecoverable, RedundantGdMismatch, UncleanShutdown,
+        };
+        match self {
+            UncleanShutdown => "VMDK-UNCLEAN-SHUTDOWN",
+            FtpAsciiMangled => "VMDK-FTP-ASCII-MANGLED",
+            RedundantGdMismatch => "VMDK-RGD-MISMATCH",
+            PrimaryGdRecoverableViaRgd { .. } => "VMDK-PRIMARY-GD-RECOVERABLE",
+            PrimaryGdUnrecoverable { .. } => "VMDK-PRIMARY-GD-UNRECOVERABLE",
+            DanglingGrainTable { .. } => "VMDK-DANGLING-GT",
+            DanglingGrain { .. } => "VMDK-DANGLING-GRAIN",
+        }
+    }
+
+    fn note(&self) -> String {
+        use AnomalyKind::{
+            DanglingGrain, DanglingGrainTable, FtpAsciiMangled, PrimaryGdRecoverableViaRgd,
+            PrimaryGdUnrecoverable, RedundantGdMismatch, UncleanShutdown,
+        };
+        match self {
+            UncleanShutdown => "uncleanShutdown flag set — the disk was not closed cleanly; \
+                                in-flight writes may be inconsistent"
+                .to_string(),
+            FtpAsciiMangled => "header newline-detection bytes mangled — the image was likely \
+                                corrupted by an ASCII-mode FTP transfer"
+                .to_string(),
+            RedundantGdMismatch => "redundant grain directory diverges from the primary — the \
+                                    grain tables they reference hold different contents"
+                .to_string(),
+            PrimaryGdRecoverableViaRgd { damaged, total, recoverable } => format!(
+                "{damaged} of {total} grain-directory entries damaged, {recoverable} recoverable via the RGD"
+            ),
+            PrimaryGdUnrecoverable { unrecoverable } => format!(
+                "{unrecoverable} grain-directory entries damaged with no RGD recovery available"
+            ),
+            DanglingGrainTable { count } => format!(
+                "{count} grain-table pointer(s) point beyond end-of-file (truncation or tampering)"
+            ),
+            DanglingGrain { count } => format!(
+                "{count} grain pointer(s) point beyond end-of-file (truncation or tampering)"
+            ),
+        }
+    }
+
+    fn mitre(&self) -> &'static [&'static str] {
+        match self {
+            // Divergent GD/RGD contents are consistent with stored-data manipulation.
+            AnomalyKind::RedundantGdMismatch => &["T1565.001"],
+            _ => &[],
+        }
+    }
+
+    fn evidence(&self) -> Vec<forensicnomicon::report::Evidence> {
+        use AnomalyKind::{DanglingGrain, DanglingGrainTable, PrimaryGdRecoverableViaRgd, PrimaryGdUnrecoverable};
+        let ev = |field: &str, value: String| forensicnomicon::report::Evidence {
+            field: field.to_string(),
+            value,
+            location: None,
+        };
+        match self {
+            PrimaryGdRecoverableViaRgd { damaged, total, recoverable } => vec![
+                ev("damaged", damaged.to_string()),
+                ev("total", total.to_string()),
+                ev("recoverable", recoverable.to_string()),
+            ],
+            PrimaryGdUnrecoverable { unrecoverable } => {
+                vec![ev("unrecoverable", unrecoverable.to_string())]
+            }
+            DanglingGrainTable { count } | DanglingGrain { count } => {
+                vec![ev("count", count.to_string())]
+            }
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// Reparsed VMDK4 sparse layout needed for RGD / integrity analysis.
@@ -483,86 +588,59 @@ impl<R: Read + Seek> VmdkIntegrity<R> {
         }))
     }
 
-    /// Run every analysis and aggregate the findings into a graded anomaly list,
-    /// sorted most-severe first.
-    pub fn analyse(&mut self) -> io::Result<Vec<VmdkAnomaly>> {
-        let mut out = Vec::new();
+    /// Run every analysis and aggregate the findings into a graded list of
+    /// canonical [`Finding`]s, sorted most-severe first.
+    pub fn analyse(&mut self) -> io::Result<Vec<Finding>> {
+        use forensicnomicon::report::{Observation, Source};
+
+        let mut kinds: Vec<AnomalyKind> = Vec::new();
 
         if let Some(p) = self.header_provenance()? {
             if p.unclean_shutdown {
-                out.push(VmdkAnomaly {
-                    severity: Severity::Warning,
-                    kind: AnomalyKind::UncleanShutdown,
-                    detail: "uncleanShutdown flag set — the disk was not closed cleanly; \
-                             in-flight writes may be inconsistent"
-                        .to_string(),
-                });
+                kinds.push(AnomalyKind::UncleanShutdown);
             }
             if !p.newline_check_intact {
-                out.push(VmdkAnomaly {
-                    severity: Severity::Error,
-                    kind: AnomalyKind::FtpAsciiMangled,
-                    detail: "header newline-detection bytes mangled — the image was likely \
-                             corrupted by an ASCII-mode FTP transfer"
-                        .to_string(),
-                });
+                kinds.push(AnomalyKind::FtpAsciiMangled);
             }
         }
 
         let recovery = self.grain_directory_recovery()?;
         if recovery.has_rgd && !self.validate_rgd()? {
-            out.push(VmdkAnomaly {
-                severity: Severity::Error,
-                kind: AnomalyKind::RedundantGdMismatch,
-                detail: "redundant grain directory diverges from the primary — the grain \
-                         tables they reference hold different contents"
-                    .to_string(),
-            });
+            kinds.push(AnomalyKind::RedundantGdMismatch);
         }
         if recovery.recoverable_via_rgd > 0 {
-            out.push(VmdkAnomaly {
-                severity: Severity::Warning,
-                kind: AnomalyKind::PrimaryGdRecoverableViaRgd,
-                detail: format!(
-                    "{} of {} grain-directory entries damaged, {} recoverable via the RGD",
-                    recovery.primary_damaged, recovery.total_entries, recovery.recoverable_via_rgd
-                ),
+            kinds.push(AnomalyKind::PrimaryGdRecoverableViaRgd {
+                damaged: recovery.primary_damaged,
+                total: recovery.total_entries,
+                recoverable: recovery.recoverable_via_rgd,
             });
         }
         if recovery.unrecoverable > 0 {
-            out.push(VmdkAnomaly {
-                severity: Severity::Error,
-                kind: AnomalyKind::PrimaryGdUnrecoverable,
-                detail: format!(
-                    "{} grain-directory entries damaged with no RGD recovery available",
-                    recovery.unrecoverable
-                ),
+            kinds.push(AnomalyKind::PrimaryGdUnrecoverable {
+                unrecoverable: recovery.unrecoverable,
             });
         }
 
         let integrity = self.check_integrity()?;
         if integrity.out_of_bounds_grain_tables > 0 {
-            out.push(VmdkAnomaly {
-                severity: Severity::Error,
-                kind: AnomalyKind::DanglingGrainTable,
-                detail: format!(
-                    "{} grain-table pointer(s) point beyond end-of-file (truncation or tampering)",
-                    integrity.out_of_bounds_grain_tables
-                ),
+            kinds.push(AnomalyKind::DanglingGrainTable {
+                count: integrity.out_of_bounds_grain_tables,
             });
         }
         if integrity.out_of_bounds_grains > 0 {
-            out.push(VmdkAnomaly {
-                severity: Severity::Error,
-                kind: AnomalyKind::DanglingGrain,
-                detail: format!(
-                    "{} grain pointer(s) point beyond end-of-file (truncation or tampering)",
-                    integrity.out_of_bounds_grains
-                ),
+            kinds.push(AnomalyKind::DanglingGrain {
+                count: integrity.out_of_bounds_grains,
             });
         }
 
-        out.sort_by_key(|a| std::cmp::Reverse(a.severity));
+        let source = Source {
+            analyzer: "vmdk-forensic".to_string(),
+            scope: "VMDK".to_string(),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        };
+        let mut out: Vec<Finding> = kinds.iter().map(|k| k.to_finding(source.clone())).collect();
+        // Most-severe first; unrated (None) sorts last.
+        out.sort_by(|a, b| b.severity.cmp(&a.severity));
         Ok(out)
     }
 }

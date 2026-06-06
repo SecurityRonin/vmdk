@@ -16,13 +16,14 @@ vmdk-forensic = "0.1"
 ```
 
 ```rust
-use vmdk_forensic::{VmdkIntegrity, Severity};
+use vmdk_forensic::VmdkIntegrity;
+use forensicnomicon::report::Severity;
 
 let mut a = VmdkIntegrity::new(std::fs::File::open("disk.vmdk")?);
 
-for anomaly in a.analyse()? {
-    if anomaly.severity >= Severity::Warning {
-        println!("[{:?}] {:?} — {}", anomaly.severity, anomaly.kind, anomaly.detail);
+for finding in a.analyse()? {
+    if finding.severity >= Some(Severity::Medium) {
+        println!("[{:?}] {} — {}", finding.severity, finding.code, finding.note);
     }
 }
 # Ok::<(), std::io::Error>(())
@@ -30,19 +31,21 @@ for anomaly in a.analyse()? {
 
 ## What it detects
 
-`analyse()` aggregates every check into a severity-graded `Vec<VmdkAnomaly>` (sorted
-worst-first); each finding carries its `kind` and a plain-language `detail` of its
-forensic significance.
+`analyse()` aggregates every check into a severity-graded `Vec<Finding>` of
+canonical [`forensicnomicon::report`](https://crates.io/crates/forensicnomicon)
+findings (sorted worst-first), so VMDK findings normalize alongside every other
+SecurityRonin analyzer. Each carries a stable `code`, a 5-level `severity`, a
+`category`, and a plain-language `note`.
 
-| Severity | `AnomalyKind` | Meaning |
+| Severity | `code` | Meaning |
 |---|---|---|
-| Error | `RedundantGdMismatch` | The redundant grain directory diverges from the primary — the grain tables they reference hold different contents (compared by **content**, not pointers, so healthy two-copy images don't false-positive) |
-| Error | `DanglingGrainTable` | A grain-table pointer points beyond end-of-file (truncation or tampering) |
-| Error | `DanglingGrain` | A grain pointer points beyond end-of-file |
-| Error | `PrimaryGdUnrecoverable` | The primary grain directory is damaged with no RGD recovery available |
-| Error | `FtpAsciiMangled` | Header newline-detection bytes were rewritten by an ASCII-mode FTP transfer |
-| Warning | `PrimaryGdRecoverableViaRgd` | The primary grain directory is damaged but recoverable via the redundant copy |
-| Warning | `UncleanShutdown` | `uncleanShutdown` flag set — the disk was not closed cleanly |
+| High | `VMDK-RGD-MISMATCH` | The redundant grain directory diverges from the primary — the grain tables they reference hold different contents (compared by **content**, not pointers, so healthy two-copy images don't false-positive). Consistent with MITRE ATT&CK T1565.001 |
+| High | `VMDK-DANGLING-GT` | A grain-table pointer points beyond end-of-file (truncation or tampering) |
+| High | `VMDK-DANGLING-GRAIN` | A grain pointer points beyond end-of-file |
+| High | `VMDK-PRIMARY-GD-UNRECOVERABLE` | The primary grain directory is damaged with no RGD recovery available |
+| High | `VMDK-FTP-ASCII-MANGLED` | Header newline-detection bytes were rewritten by an ASCII-mode FTP transfer |
+| Medium | `VMDK-PRIMARY-GD-RECOVERABLE` | The primary grain directory is damaged but recoverable via the redundant copy |
+| Low | `VMDK-UNCLEAN-SHUTDOWN` | `uncleanShutdown` flag set — the disk was not closed cleanly |
 
 ## Individual checks
 

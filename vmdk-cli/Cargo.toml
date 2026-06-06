@@ -1,6 +1,6 @@
 [package]
 name         = "vmdk-cli"
-version      = "0.5.1"
+version      = "0.6.0"
 edition      = "2021"
 rust-version = "1.85"
 description  = "CLI tool for inspecting VMDK disk images"
@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 vmdk = { version = "0.5.1", path = "../vmdk" }
-vmdk-forensic = { version = "0.5.1", path = "../vmdk-forensic" }
+vmdk-forensic = { version = "0.6.0", path = "../vmdk-forensic" }
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
