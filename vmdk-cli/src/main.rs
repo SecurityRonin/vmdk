@@ -431,7 +431,7 @@ fn cmd_hash(path: &std::path::Path, recover: bool) -> ExitCode {
 /// per-entry recovery analysis. Distinguishes a truly absent RGD from one that is
 /// present but diverges — and, when the primary GD is damaged, reports how much of
 /// it the RGD can recover (information qemu-img cannot provide).
-fn rgd_status_line(matches: bool, rec: &vmdk::GdRecoveryReport) -> String {
+fn rgd_status_line(matches: bool, rec: &vmdk_forensic::GdRecoveryReport) -> String {
     if !rec.has_rgd {
         "RGD:     absent or not applicable".to_string()
     } else if matches {
@@ -460,11 +460,14 @@ fn cmd_verify(path: &std::path::Path, recover: bool) -> ExitCode {
     println!("Format:  {} v{}", info.disk_type, info.version);
     println!("Size:    {} bytes", fmt_commas(info.virtual_disk_size));
 
-    match reader.validate_rgd() {
-        Ok(matches) => {
-            let recovery = reader.grain_directory_recovery().unwrap_or_default();
-            println!("{}", rgd_status_line(matches, &recovery));
-        }
+    // Forensic analysis runs through vmdk-forensic, which reparses the raw image.
+    let mut integ = match std::fs::File::open(path) {
+        Ok(f) => vmdk_forensic::VmdkIntegrity::new(f),
+        Err(e) => return fail(format!("error: {e}")),
+    };
+    let recovery = integ.grain_directory_recovery().unwrap_or_default();
+    match integ.validate_rgd() {
+        Ok(matches) => println!("{}", rgd_status_line(matches, &recovery)),
         Err(e) => println!("RGD:     ERROR — {e}"),
     }
 
@@ -482,11 +485,21 @@ fn cmd_verify(path: &std::path::Path, recover: bool) -> ExitCode {
 
     // Structural integrity: dangling GD/GT pointers signal truncation or tampering.
     let mut failed = false;
-    match reader.check_integrity() {
+    match integ.check_integrity() {
         Ok(report) if report.is_ok() => {
             println!(
                 "Integrity: OK ({} grains checked, no out-of-bounds pointers)",
                 fmt_commas(report.grains_checked)
+            );
+        }
+        // Under --recover, grain-table damage the RGD can fully resolve does not fail
+        // the verdict (the redundant directory makes the image readable).
+        Ok(report)
+            if recover && recovery.unrecoverable == 0 && report.out_of_bounds_grains == 0 =>
+        {
+            println!(
+                "Integrity: OK after recovery ({} grain table(s) resolved via the RGD)",
+                report.out_of_bounds_grain_tables
             );
         }
         Ok(report) => {
@@ -634,13 +647,13 @@ mod tests {
 
     #[test]
     fn rgd_status_absent_when_no_rgd() {
-        let rec = vmdk::GdRecoveryReport::default(); // has_rgd = false
+        let rec = vmdk_forensic::GdRecoveryReport::default(); // has_rgd = false
         assert!(rgd_status_line(false, &rec).contains("absent or not applicable"));
     }
 
     #[test]
     fn rgd_status_ok_when_matches() {
-        let rec = vmdk::GdRecoveryReport {
+        let rec = vmdk_forensic::GdRecoveryReport {
             has_rgd: true,
             total_entries: 4,
             primary_intact: 4,
@@ -653,7 +666,7 @@ mod tests {
     fn rgd_status_reports_recoverable_damage() {
         // Primary GD damaged but the RGD can recover it — the examiner must see this,
         // not a misleading "absent".
-        let rec = vmdk::GdRecoveryReport {
+        let rec = vmdk_forensic::GdRecoveryReport {
             has_rgd: true,
             total_entries: 5,
             primary_intact: 3,
@@ -672,7 +685,7 @@ mod tests {
     #[test]
     fn rgd_status_benign_divergence_when_primary_intact() {
         // RGD present and differs, but every primary entry is usable — benign.
-        let rec = vmdk::GdRecoveryReport {
+        let rec = vmdk_forensic::GdRecoveryReport {
             has_rgd: true,
             total_entries: 4,
             primary_intact: 4,

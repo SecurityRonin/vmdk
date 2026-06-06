@@ -70,28 +70,6 @@ pub struct AllocatedGrain {
     pub sector_count: u64,
 }
 
-/// Result of a structural integrity walk ([`VmdkReader::check_integrity`]).
-///
-/// Counts grain-directory / grain-table pointers that fall outside the backing file —
-/// the signature of a truncated or tampered image. `is_ok()` is the headline verdict.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct IntegrityReport {
-    /// Number of allocated grains examined.
-    pub grains_checked: u64,
-    /// Allocated grains whose data offset lies beyond end-of-file.
-    pub out_of_bounds_grains: u64,
-    /// Grain-directory entries whose grain table lies beyond end-of-file.
-    pub out_of_bounds_grain_tables: u64,
-}
-
-impl IntegrityReport {
-    /// `true` when no dangling pointers were found.
-    pub fn is_ok(&self) -> bool {
-        self.out_of_bounds_grains == 0 && self.out_of_bounds_grain_tables == 0
-    }
-}
-
 /// Structured metadata for a VMDK virtual disk.
 ///
 /// Returned by [`VmdkReader::info`].  All fields are `Clone`-able so callers
@@ -121,61 +99,6 @@ pub struct VmdkInfo {
     pub descriptor_text: String,
     /// Parsed `ddb.*` disk database (geometry, adapter type, versions, UUID, …).
     pub disk_database: DiskDatabase,
-}
-
-/// Provenance/integrity signals from a VMDK4 (KDMV) sparse extent header.
-///
-/// Returned by [`VmdkReader::header_provenance`]. These fields are read but
-/// discarded by both `qemu-img` and libvmdk; they carry forensic weight.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-// Each bool is an independent provenance signal (unclean shutdown, FTP-mangling,
-// redundant GD, compression, markers) read straight from distinct header bytes/flags;
-// collapsing them into an enum would lose the one-field-per-signal clarity.
-#[allow(clippy::struct_excessive_bools)]
-pub struct HeaderProvenance {
-    /// Header format version (1, 2, or 3).
-    pub version: u32,
-    /// `uncleanShutdown` (byte 72) — the disk was not closed cleanly (crash /
-    /// power-loss / live image while the VM was running): in-flight writes may be
-    /// inconsistent.
-    pub unclean_shutdown: bool,
-    /// The four newline-detection bytes (73..77) are exactly `0A 20 0D 0A`. A
-    /// `false` here means the binary was mangled by an ASCII-mode FTP transfer
-    /// (which rewrites `\r\n`), i.e. the image is corrupt in transit.
-    pub newline_check_intact: bool,
-    /// Flag bit `0x2` — a redundant (secondary) grain directory is present.
-    pub uses_redundant_gd: bool,
-    /// Flag bit `0x10000` — grains carry compressed data.
-    pub compressed: bool,
-    /// Flag bit `0x20000` — the stream carries metadata markers (streamOptimized).
-    pub has_markers: bool,
-}
-
-/// Per-entry recovery analysis of the grain directory against its redundant copy.
-///
-/// Returned by [`VmdkReader::grain_directory_recovery`]. VMDK keeps a redundant
-/// grain directory (RGD) so a damaged primary GD can still be recovered; `qemu-img`
-/// discards the RGD outright, so this analysis is unique to a forensic reader.
-///
-/// `primary_intact + primary_damaged == total_entries`, and
-/// `recoverable_via_rgd + unrecoverable == primary_damaged`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct GdRecoveryReport {
-    /// `true` when the format carries a usable redundant grain directory.
-    pub has_rgd: bool,
-    /// Number of grain-directory entries analysed.
-    pub total_entries: usize,
-    /// Primary entries that are usable as-is (in-bounds, or sparse and agreeing with the RGD).
-    pub primary_intact: usize,
-    /// Primary entries that are damaged: out-of-bounds, or sparse where the RGD still
-    /// holds a valid pointer (a grain-table reference lost from the primary).
-    pub primary_damaged: usize,
-    /// Damaged primary entries the RGD can recover (its entry is in-bounds and non-zero).
-    pub recoverable_via_rgd: usize,
-    /// Damaged primary entries the RGD cannot recover (damaged in both directories).
-    pub unrecoverable: usize,
 }
 
 // ── Internal format dispatch ──────────────────────────────────────────────────
@@ -408,262 +331,6 @@ impl<R: Read + Seek> VmdkReader<R> {
         &self.disk_type
     }
 
-    /// Validate the redundant grain directory (RGD) against the primary GD.
-    ///
-    /// Returns `Ok(true)` if both directories are present and the grain tables they
-    /// reference hold identical contents, `Ok(false)` if the RGD is absent or the
-    /// redundant copy diverges (indicating corruption), and `Err(_)` on I/O failure.
-    ///
-    /// VMDK stores the grain tables **twice** \u2014 the GD and RGD point to *separate*
-    /// copies — so a healthy image has differing directory pointer values. This check
-    /// therefore compares the grain-table **contents** each directory references, not
-    /// the directory pointers themselves (which would false-positive on every real
-    /// multi-copy image).
-    ///
-    /// For flat and COWD/seSparse formats (which have no RGD) this always returns `Ok(false)`.
-    pub fn validate_rgd(&mut self) -> io::Result<bool> {
-        let (primary_gd, num_gtes_per_gt) = match &self.fmt {
-            FormatState::Sparse {
-                grain_dir,
-                num_gtes_per_gt,
-                ..
-            } => (grain_dir.clone(), *num_gtes_per_gt),
-            _ => return Ok(false), // Flat/seSparse/COWD have no RGD
-        };
-        let rgd_offset = self.rgd_offset;
-        if rgd_offset == 0 || rgd_offset == crate::header::GD_AT_END {
-            return Ok(false);
-        }
-        let gd_entry_count = self.gd_entry_count;
-        let file_len = self.inner.seek(SeekFrom::End(0))?;
-
-        // Read the redundant grain directory (same width as the primary GD).
-        let rgd_byte_offset = rgd_offset
-            .checked_mul(SECTOR_SIZE)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "rgd_offset overflow"))?;
-        self.inner.seek(SeekFrom::Start(rgd_byte_offset))?;
-        let mut rgd_bytes = vec![0u8; gd_entry_count * 4];
-        self.inner.read_exact(&mut rgd_bytes)?;
-        let rgd: Vec<u32> = rgd_bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
-            .collect();
-
-        // Compare the grain table each directory entry references.
-        let gt_byte_len = (num_gtes_per_gt * 4) as usize;
-        for i in 0..gd_entry_count {
-            let p = primary_gd.get(i).copied().unwrap_or(0);
-            let r = rgd.get(i).copied().unwrap_or(0);
-            if p == 0 && r == 0 {
-                continue; // both directories agree the region has no grain table
-            }
-            if (p == 0) != (r == 0) {
-                return Ok(false); // one has a grain table, the other does not
-            }
-            let pgt = self.read_grain_table_bytes(p, gt_byte_len, file_len)?;
-            let rgt = self.read_grain_table_bytes(r, gt_byte_len, file_len)?;
-            match (pgt, rgt) {
-                (Some(a), Some(b)) if a == b => {}
-                _ => return Ok(false), // out-of-bounds or divergent grain-table contents
-            }
-        }
-        Ok(true)
-    }
-
-    /// Read the `gt_byte_len` bytes of the grain table at `gt_sector`, or `None` if it
-    /// would fall outside the file (a dangling/out-of-bounds directory pointer).
-    fn read_grain_table_bytes(
-        &mut self,
-        gt_sector: u32,
-        gt_byte_len: usize,
-        file_len: u64,
-    ) -> io::Result<Option<Vec<u8>>> {
-        let gt_byte = u64::from(gt_sector) * SECTOR_SIZE;
-        if gt_byte.saturating_add(gt_byte_len as u64) > file_len {
-            return Ok(None);
-        }
-        self.inner.seek(SeekFrom::Start(gt_byte))?;
-        let mut buf = vec![0u8; gt_byte_len];
-        self.inner.read_exact(&mut buf)?;
-        Ok(Some(buf))
-    }
-
-    /// Analyse the primary grain directory against the redundant grain directory (RGD)
-    /// and report which damaged primary entries the RGD can recover.
-    ///
-    /// Unlike [`validate_rgd`](Self::validate_rgd) (a single identical/not-identical
-    /// verdict), this classifies every entry, so a partially-corrupted image can be
-    /// triaged: how much of the primary GD is intact, how much is damaged, and how
-    /// much of the damage the RGD can still recover. `qemu-img` ignores the RGD, so
-    /// this recovery view is unavailable there.
-    ///
-    /// For flat/COWD/seSparse (no RGD) the report has `has_rgd == false` and zeroed counts.
-    pub fn grain_directory_recovery(&mut self) -> io::Result<GdRecoveryReport> {
-        let (primary_gd, num_gtes_per_gt) = match &self.fmt {
-            FormatState::Sparse {
-                grain_dir,
-                num_gtes_per_gt,
-                ..
-            } => (grain_dir.clone(), *num_gtes_per_gt),
-            _ => return Ok(GdRecoveryReport::default()), // Flat/seSparse/COWD have no RGD
-        };
-        let rgd_offset = self.rgd_offset;
-        if rgd_offset == 0 || rgd_offset == crate::header::GD_AT_END {
-            return Ok(GdRecoveryReport::default());
-        }
-        let gd_entry_count = self.gd_entry_count;
-        let file_len = self.inner.seek(SeekFrom::End(0))?;
-
-        // Read the RGD (same width as the primary GD).
-        let rgd_byte_offset = rgd_offset
-            .checked_mul(SECTOR_SIZE)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "rgd_offset overflow"))?;
-        self.inner.seek(SeekFrom::Start(rgd_byte_offset))?;
-        let mut rgd_bytes = vec![0u8; gd_entry_count * 4];
-        self.inner.read_exact(&mut rgd_bytes)?;
-        let rgd: Vec<u32> = rgd_bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
-            .collect();
-
-        // A grain-table pointer is usable when it is non-zero and the full grain table
-        // it points at lies within the file.
-        let gt_byte_len = num_gtes_per_gt * 4;
-        let in_bounds = |ptr: u32| -> bool {
-            ptr != 0
-                && u64::from(ptr)
-                    .saturating_mul(SECTOR_SIZE)
-                    .saturating_add(gt_byte_len)
-                    <= file_len
-        };
-
-        let mut report = GdRecoveryReport {
-            has_rgd: true,
-            total_entries: gd_entry_count,
-            ..GdRecoveryReport::default()
-        };
-        for i in 0..gd_entry_count {
-            let p = primary_gd.get(i).copied().unwrap_or(0);
-            let r = rgd.get(i).copied().unwrap_or(0);
-            if in_bounds(p) || (p == 0 && r == 0) {
-                // Primary is directly usable, or both agree the region is sparse.
-                report.primary_intact += 1;
-            } else {
-                // Out-of-bounds pointer, or a sparse primary entry where the RGD still
-                // holds a pointer (a reference lost from the primary).
-                report.primary_damaged += 1;
-                if in_bounds(r) {
-                    report.recoverable_via_rgd += 1;
-                } else {
-                    report.unrecoverable += 1;
-                }
-            }
-        }
-        Ok(report)
-    }
-
-    /// Walk the grain directory and tables, counting pointers that fall beyond
-    /// end-of-file (the signature of a truncated or tampered image).
-    ///
-    /// Flat extents have no grain metadata (bounds are enforced at open), so they
-    /// always report clean. seSparse and COWD share the sparse walk via their
-    /// in-memory grain directory.
-    pub fn check_integrity(&mut self) -> io::Result<IntegrityReport> {
-        let file_len = self.inner.seek(SeekFrom::End(0))?;
-        let mut report = IntegrityReport::default();
-
-        match &self.fmt {
-            FormatState::Flat => return Ok(report),
-            FormatState::Sparse {
-                grain_dir,
-                grain_size_bytes,
-                num_gtes_per_gt,
-                ..
-            } => {
-                let grain_dir = grain_dir.clone();
-                let grain_size_bytes = *grain_size_bytes;
-                let num_gtes_per_gt = *num_gtes_per_gt;
-                let gt_byte_len = num_gtes_per_gt * 4;
-                for (gd_idx, &primary_gt_sector) in grain_dir.iter().enumerate() {
-                    // Recovery mode: resolve a dangling primary GT pointer through the RGD,
-                    // so the report reflects integrity *after* recovery.
-                    let gt_sector = if self.rgd_fallback {
-                        self.resilient_gt_sector(gd_idx, primary_gt_sector, num_gtes_per_gt)?
-                    } else {
-                        primary_gt_sector
-                    };
-                    if gt_sector == 0 {
-                        continue;
-                    }
-                    let gt_byte = u64::from(gt_sector) * SECTOR_SIZE;
-                    if gt_byte.saturating_add(gt_byte_len) > file_len {
-                        report.out_of_bounds_grain_tables += 1;
-                        continue;
-                    }
-                    self.inner.seek(SeekFrom::Start(gt_byte))?;
-                    let mut gt = vec![0u8; gt_byte_len as usize];
-                    self.inner.read_exact(&mut gt)?;
-                    for c in gt.chunks_exact(4) {
-                        let gte = u32::from_le_bytes(c.try_into().expect("4 bytes"));
-                        if gte <= 1 {
-                            continue; // sparse / explicitly-zeroed
-                        }
-                        report.grains_checked += 1;
-                        let grain_byte = u64::from(gte) * SECTOR_SIZE;
-                        if grain_byte.saturating_add(grain_size_bytes) > file_len {
-                            report.out_of_bounds_grains += 1;
-                        }
-                    }
-                }
-            }
-            FormatState::SeSparse {
-                grain_dir,
-                grain_size_bytes,
-                gt_offset_sectors,
-                grains_offset_sectors,
-            } => {
-                let grain_dir = grain_dir.clone();
-                let grain_size_bytes = *grain_size_bytes;
-                let grain_sectors = grain_size_bytes / SECTOR_SIZE;
-                let gt_off = *gt_offset_sectors;
-                let grains_off = *grains_offset_sectors;
-                let gt_byte_len = sesparse::SE_GTES_PER_GT * 8;
-                for &gd_entry in &grain_dir {
-                    if gd_entry == 0 {
-                        continue;
-                    }
-                    if gd_entry & sesparse::SE_GD_ALLOC_MASK != sesparse::SE_GD_ALLOC_FLAG {
-                        report.out_of_bounds_grain_tables += 1;
-                        continue;
-                    }
-                    let gt_table_idx = gd_entry & sesparse::SE_GD_INDEX_MASK;
-                    let gt_sector = gt_off + gt_table_idx * sesparse::SE_GT_SECTORS;
-                    let gt_byte = gt_sector * SECTOR_SIZE;
-                    if gt_byte.saturating_add(gt_byte_len) > file_len {
-                        report.out_of_bounds_grain_tables += 1;
-                        continue;
-                    }
-                    self.inner.seek(SeekFrom::Start(gt_byte))?;
-                    let mut gt = vec![0u8; gt_byte_len as usize];
-                    self.inner.read_exact(&mut gt)?;
-                    for c in gt.chunks_exact(8) {
-                        let gte = u64::from_le_bytes(c.try_into().expect("8 bytes"));
-                        if gte & sesparse::SE_GTE_TYPE_MASK != sesparse::SE_GTE_TYPE_ALLOCATED {
-                            continue;
-                        }
-                        report.grains_checked += 1;
-                        let grain_idx = sesparse::se_gte_grain_index(gte);
-                        let grain_byte = (grains_off + grain_idx * grain_sectors) * SECTOR_SIZE;
-                        if grain_byte.saturating_add(grain_size_bytes) > file_len {
-                            report.out_of_bounds_grains += 1;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(report)
-    }
-
     /// CID from the embedded descriptor; `0xffff_ffff` when absent.
     pub fn cid(&self) -> u32 {
         self.cid
@@ -719,30 +386,6 @@ impl<R: Read + Seek> VmdkReader<R> {
             }
         }
         format!("{:08x}", self.cid)
-    }
-
-    /// Read the VMDK4 (KDMV) sparse extent header's provenance/integrity signals
-    /// (`uncleanShutdown`, the newline-detection bytes, and the flag bits).
-    ///
-    /// Returns `Ok(None)` when the first 512 bytes are not a VMDK4 KDMV header
-    /// (COWD, seSparse, or flat extents have no such header).
-    pub fn header_provenance(&mut self) -> io::Result<Option<HeaderProvenance>> {
-        self.inner.seek(SeekFrom::Start(0))?;
-        let mut hdr = [0u8; 512];
-        self.inner.read_exact(&mut hdr)?;
-        if u32::from_le_bytes(hdr[0..4].try_into().expect("4 bytes")) != header::MAGIC {
-            return Ok(None);
-        }
-        let version = u32::from_le_bytes(hdr[4..8].try_into().expect("4 bytes"));
-        let flags = u32::from_le_bytes(hdr[8..12].try_into().expect("4 bytes"));
-        Ok(Some(HeaderProvenance {
-            version,
-            unclean_shutdown: hdr[72] != 0,
-            newline_check_intact: hdr[73..77] == [0x0A, 0x20, 0x0D, 0x0A],
-            uses_redundant_gd: flags & 0x0000_0002 != 0,
-            compressed: flags & 0x0001_0000 != 0,
-            has_markers: flags & 0x0002_0000 != 0,
-        }))
     }
 
     /// Structured snapshot of all metadata for this image.
@@ -1964,55 +1607,6 @@ mod tests {
     // ── check_integrity (dangling-pointer / corruption detection) ─────────────
 
     #[test]
-    fn check_integrity_clean_sparse_is_ok() {
-        let vmdk = test_sparse_vmdk(&[0u8; 512]);
-        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let report = reader.check_integrity().expect("check_integrity");
-        assert!(
-            report.is_ok(),
-            "clean VMDK must report no anomalies: {report:?}"
-        );
-        assert_eq!(report.out_of_bounds_grains, 0);
-        assert_eq!(report.out_of_bounds_grain_tables, 0);
-        assert_eq!(
-            report.grains_checked, 1,
-            "one allocated grain in test_sparse_vmdk"
-        );
-    }
-
-    #[test]
-    fn check_integrity_flags_grain_offset_past_eof() {
-        // Patch GTE[0] to point to a grain sector far beyond EOF → dangling pointer.
-        let mut vmdk = test_sparse_vmdk(&[0u8; 512]);
-        // GT lives at sector 23 (GT_SECTOR in testutil); GTE[0] is the first 4 bytes.
-        let gt_byte = 23 * 512;
-        vmdk[gt_byte..gt_byte + 4].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes()); // huge sector
-        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let report = reader.check_integrity().expect("check_integrity");
-        assert!(
-            !report.is_ok(),
-            "corrupted grain pointer must fail integrity"
-        );
-        assert_eq!(
-            report.out_of_bounds_grains, 1,
-            "the one out-of-bounds grain must be counted"
-        );
-    }
-
-    #[test]
-    fn check_integrity_flags_grain_table_past_eof() {
-        // Patch GD[0] to point to a GT sector far beyond EOF.
-        let mut vmdk = test_sparse_vmdk(&[0u8; 512]);
-        // GD lives at sector 21 (GD_SECTOR in testutil); GD[0] is the first 4 bytes.
-        let gd_byte = 21 * 512;
-        vmdk[gd_byte..gd_byte + 4].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes());
-        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let report = reader.check_integrity().expect("check_integrity");
-        assert!(!report.is_ok(), "corrupted GD pointer must fail integrity");
-        assert_eq!(report.out_of_bounds_grain_tables, 1);
-    }
-
-    #[test]
     fn grain_size_zero_rejected() {
         let img = vmdk_header_bytes(8, 0, 512);
         assert!(VmdkReader::open(Cursor::new(img)).is_err());
@@ -2112,60 +1706,6 @@ mod tests {
     }
 
     // ── RGD validation ───────────────────────────────────────────────────────
-
-    #[test]
-    fn validate_rgd_returns_true_for_valid_sparse_vmdk() {
-        // test_sparse_vmdk builds a VMDK with matching GD and RGD.
-        let vmdk = test_sparse_vmdk(&[0u8; 512]);
-        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        assert!(
-            reader.validate_rgd().expect("validate_rgd"),
-            "test_sparse_vmdk must have valid (matching) RGD"
-        );
-    }
-
-    #[test]
-    fn validate_rgd_true_for_real_two_copy_image() {
-        // minimal.vmdk (real qemu output) stores the grain tables twice — the GD and
-        // RGD point to SEPARATE copies, so their pointer values differ even though the
-        // image is healthy. A correct RGD check compares the GT *contents*, not the
-        // directory pointers.
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/minimal.vmdk");
-        let bytes = std::fs::read(path).expect("read minimal.vmdk");
-        let mut r = VmdkReader::open(Cursor::new(bytes)).expect("open");
-        assert!(
-            r.validate_rgd().expect("validate_rgd"),
-            "healthy two-copy image: GD/RGD grain-table contents match"
-        );
-    }
-
-    #[test]
-    fn validate_rgd_false_when_redundant_gt_content_differs() {
-        // Corrupt the redundant grain table (minimal.vmdk keeps it at sector 22) so its
-        // content diverges from the primary GT (sector 27) — a real RGD mismatch.
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/minimal.vmdk");
-        let mut bytes = std::fs::read(path).expect("read minimal.vmdk");
-        let rgt = 22 * 512;
-        for b in &mut bytes[rgt..rgt + 4] {
-            *b ^= 0xFF;
-        }
-        let mut r = VmdkReader::open(Cursor::new(bytes)).expect("open");
-        assert!(
-            !r.validate_rgd().expect("validate_rgd"),
-            "divergent redundant GT content must be flagged as a mismatch"
-        );
-    }
-
-    #[test]
-    fn validate_rgd_returns_false_for_flat_format() {
-        let vmdk = gd_at_end_stream_opt_vmdk(); // streamOptimized, no RGD
-        let mut reader = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        // streamOptimized with GD_AT_END: rgd_offset=0, returns false
-        assert!(
-            !reader.validate_rgd().expect("validate_rgd flat"),
-            "streamOptimized with no RGD must return false"
-        );
-    }
 
     // ── VMFS flat / ZERO extent descriptor parsing ───────────────────────────
 
@@ -2834,7 +2374,7 @@ mod tests {
     // ── Coverage: seSparse method branches (is_allocated / iter / integrity) ──
 
     #[test]
-    fn sesparse_is_allocated_iter_and_integrity() {
+    fn sesparse_is_allocated_and_iter() {
         let mut data = vec![0u8; 512];
         data[0] = 0x9A;
         let se = test_sesparse_vmdk(&data);
@@ -2846,9 +2386,6 @@ mod tests {
         let grains = r.iter_allocated_grains().expect("iter");
         assert_eq!(grains.len(), 1);
         assert_eq!(grains[0].start_lba, 0);
-        let rep = r.check_integrity().expect("integrity");
-        assert!(rep.is_ok());
-        assert_eq!(rep.grains_checked, 1);
     }
 
     #[test]
@@ -2863,15 +2400,12 @@ mod tests {
     }
 
     #[test]
-    fn sesparse_invalid_gd_marker_skipped_in_iter_and_flagged_in_integrity() {
+    fn sesparse_invalid_gd_marker_skipped_in_iter() {
         let mut se = test_sesparse_vmdk(&[0u8; 512]);
         let gd = 2 * 512;
         se[gd..gd + 8].copy_from_slice(&0x5000_0000_0000_0000u64.to_le_bytes());
         let mut r = VmdkReader::open(Cursor::new(se)).expect("open");
         assert!(r.iter_allocated_grains().expect("iter").is_empty());
-        let rep = r.check_integrity().expect("integrity");
-        assert_eq!(rep.out_of_bounds_grain_tables, 1);
-        assert!(!rep.is_ok());
     }
 
     // ── Coverage: Flat reader is_allocated / iter_allocated_grains ────────────
@@ -2894,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_is_allocated_and_iter_and_integrity() {
+    fn flat_is_allocated_and_iter() {
         let dir = tempfile::tempdir().unwrap();
         let mut r = open_flat_descriptor(dir.path(), &[1u8; 1024]);
         // Every in-bounds sector of a flat extent is allocated.
@@ -2906,8 +2440,6 @@ mod tests {
         assert_eq!(grains.len(), 1);
         assert_eq!(grains[0].start_lba, 0);
         assert_eq!(grains[0].sector_count, 2);
-        // Flat has no grain metadata → integrity trivially clean.
-        assert!(r.check_integrity().expect("integrity").is_ok());
     }
 
     // ── Coverage: accessors, format-specific branches, open_path arms ─────────
@@ -2942,54 +2474,6 @@ mod tests {
     }
 
     #[test]
-    fn header_provenance_clean_image() {
-        // test_sparse_vmdk writes a clean VMDK4 header: byte72=0, newline bytes intact.
-        let vmdk = test_sparse_vmdk(&[0u8; 512]);
-        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let p = r
-            .header_provenance()
-            .expect("provenance")
-            .expect("VMDK4 header");
-        assert_eq!(p.version, 1);
-        assert!(!p.unclean_shutdown, "clean image");
-        assert!(p.newline_check_intact, "newline bytes 0A 20 0D 0A intact");
-        // The fixture writes flags=0 (testutil sets bytes 8..12 to zero), so the
-        // redundant-GD flag bit (0x2) is clear even though an rgdOffset is present.
-        assert!(!p.uses_redundant_gd, "flags=0 ⇒ no redundant-GD flag bit");
-    }
-
-    #[test]
-    fn header_provenance_flags_unclean_shutdown() {
-        let mut vmdk = test_sparse_vmdk(&[0u8; 512]);
-        vmdk[72] = 1; // uncleanShutdown
-        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let p = r.header_provenance().expect("provenance").expect("VMDK4");
-        assert!(p.unclean_shutdown, "byte 72 != 0 → unclean");
-    }
-
-    #[test]
-    fn header_provenance_detects_ftp_ascii_corruption() {
-        // The newline-detection bytes (73..77) must be exactly 0A 20 0D 0A; ASCII-mode
-        // FTP rewrites \r\n and mangles them.
-        let mut vmdk = test_sparse_vmdk(&[0u8; 512]);
-        vmdk[75] = 0x0A; // was 0x0D (\r) → simulate \r\n -> \n corruption
-        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let p = r.header_provenance().expect("provenance").expect("VMDK4");
-        assert!(
-            !p.newline_check_intact,
-            "corrupted newline bytes must be flagged"
-        );
-    }
-
-    #[test]
-    fn header_provenance_none_for_non_vmdk4() {
-        // A COWD image is not a VMDK4 KDMV header → no VMDK4 provenance.
-        let cowd = test_cowd_vmdk(&[0u8; 512]);
-        let mut r = VmdkReader::open(Cursor::new(cowd)).expect("open");
-        assert!(r.header_provenance().expect("provenance").is_none());
-    }
-
-    #[test]
     fn change_track_path_reference() {
         let desc = "# Disk DescriptorFile\nversion=1\nCID=12345678\nparentCID=ffffffff\ncreateType=\"monolithicSparse\"\nchangeTrackPath=\"disk-ctk.vmdk\"\n";
         let vmdk = testutil::test_sparse_vmdk_with_descriptor(&[0u8; 512], desc);
@@ -3020,48 +2504,6 @@ mod tests {
         let vmdk = testutil::test_sparse_vmdk_with_descriptor(&[0u8; 512], desc);
         let r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
         assert_eq!(r.effective_content_id(), "12345678");
-    }
-
-    #[test]
-    fn grain_directory_recovery_recoverable_via_rgd() {
-        // Corrupt the primary GD entry (point it far out of bounds) but leave the
-        // redundant GD intact — the recovery report should flag it as RGD-recoverable.
-        // The fixture writes the primary GD at sector 21 (byte 21*512).
-        let mut vmdk = testutil::test_sparse_vmdk(&[0xAB; 512]);
-        let gd_byte = 21 * 512;
-        vmdk[gd_byte..gd_byte + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let rep = r.grain_directory_recovery().expect("recovery report");
-        assert!(rep.has_rgd, "monolithicSparse carries an RGD");
-        assert_eq!(rep.total_entries, 1);
-        assert_eq!(rep.primary_intact, 0);
-        assert_eq!(rep.primary_damaged, 1);
-        assert_eq!(rep.recoverable_via_rgd, 1);
-        assert_eq!(rep.unrecoverable, 0);
-    }
-
-    #[test]
-    fn grain_directory_recovery_clean_image_all_intact() {
-        let vmdk = testutil::test_sparse_vmdk(&[0xAB; 512]);
-        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let rep = r.grain_directory_recovery().expect("recovery report");
-        assert!(rep.has_rgd);
-        assert_eq!(rep.total_entries, 1);
-        assert_eq!(rep.primary_intact, 1);
-        assert_eq!(rep.primary_damaged, 0);
-        assert_eq!(rep.recoverable_via_rgd, 0);
-        assert_eq!(rep.unrecoverable, 0);
-    }
-
-    #[test]
-    fn grain_directory_recovery_absent_for_sesparse() {
-        // seSparse has no redundant grain directory.
-        let se = test_sesparse_vmdk(&[0u8; 512]);
-        let mut r = VmdkReader::open(Cursor::new(se)).expect("open");
-        let rep = r.grain_directory_recovery().expect("recovery report");
-        assert!(!rep.has_rgd);
-        assert_eq!(rep.total_entries, 0);
-        assert_eq!(rep.primary_damaged, 0);
     }
 
     #[test]
@@ -3259,74 +2701,6 @@ mod tests {
     }
 
     #[test]
-    fn check_integrity_recovers_gt_pointer_via_rgd() {
-        // A dangling primary GT pointer is flagged by integrity; under recovery it is
-        // resolved via the RGD, so verify --recover can confirm the image is readable.
-        let mut vmdk = test_sparse_vmdk(&[0xAB; 512]);
-        let gd_byte = 21 * 512;
-        vmdk[gd_byte..gd_byte + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        {
-            let mut r = VmdkReader::open(Cursor::new(vmdk.clone())).expect("open");
-            let rep = r.check_integrity().expect("integrity");
-            assert!(!rep.is_ok(), "dangling GT pointer flagged without recovery");
-            assert_eq!(rep.out_of_bounds_grain_tables, 1);
-        }
-        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        r.enable_rgd_fallback();
-        let rep = r.check_integrity().expect("integrity");
-        assert!(rep.is_ok(), "GT pointer recovered via RGD ⇒ integrity OK");
-        assert_eq!(rep.out_of_bounds_grain_tables, 0);
-    }
-
-    #[test]
-    fn validate_rgd_both_sparse_entries_match() {
-        // Both the primary GD[0] and RGD[0] are zero — they agree the region is sparse.
-        let mut vmdk = test_sparse_vmdk(&[0u8; 512]);
-        vmdk[21 * 512..21 * 512 + 4].copy_from_slice(&0u32.to_le_bytes());
-        vmdk[22 * 512..22 * 512 + 4].copy_from_slice(&0u32.to_le_bytes());
-        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        assert!(
-            r.validate_rgd().expect("validate"),
-            "both-sparse entries match"
-        );
-    }
-
-    #[test]
-    fn validate_rgd_mismatch_when_only_one_has_grain_table() {
-        // Primary GD[0] sparse, RGD[0] has a grain table → mismatch.
-        let mut vmdk = test_sparse_vmdk(&[0u8; 512]);
-        vmdk[21 * 512..21 * 512 + 4].copy_from_slice(&0u32.to_le_bytes());
-        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        assert!(
-            !r.validate_rgd().expect("validate"),
-            "one-sided GT is a mismatch"
-        );
-    }
-
-    #[test]
-    fn grain_directory_recovery_default_when_no_rgd_offset() {
-        let mut vmdk = test_sparse_vmdk(&[0u8; 512]);
-        vmdk[48..56].copy_from_slice(&0u64.to_le_bytes()); // rgd_offset = 0
-        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let rep = r.grain_directory_recovery().expect("recovery");
-        assert!(!rep.has_rgd);
-        assert_eq!(rep.total_entries, 0);
-    }
-
-    #[test]
-    fn grain_directory_recovery_counts_unrecoverable() {
-        // Both primary and redundant GD[0] are out of bounds — damaged in both.
-        let mut vmdk = test_sparse_vmdk(&[0u8; 512]);
-        vmdk[21 * 512..21 * 512 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        vmdk[22 * 512..22 * 512 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        let mut r = VmdkReader::open(Cursor::new(vmdk)).expect("open");
-        let rep = r.grain_directory_recovery().expect("recovery");
-        assert_eq!(rep.primary_damaged, 1);
-        assert_eq!(rep.recoverable_via_rgd, 0);
-        assert_eq!(rep.unrecoverable, 1);
-    }
-
-    #[test]
     fn open_rejects_capacity_overflow() {
         // capacity * 512 overflows u64 → InvalidGeometry rather than a panic.
         let mut vmdk = test_sparse_vmdk(&[0u8; 512]);
@@ -3401,14 +2775,12 @@ mod tests {
     }
 
     #[test]
-    fn info_and_validate_rgd_on_sesparse() {
+    fn info_on_sesparse() {
         let se = test_sesparse_vmdk(&[0u8; 512]);
-        let mut r = VmdkReader::open(Cursor::new(se)).expect("open");
+        let r = VmdkReader::open(Cursor::new(se)).expect("open");
         let info = r.info();
         assert_eq!(info.disk_type, "seSparse");
         assert_eq!(info.grain_size_bytes, 8 * 512);
-        // seSparse has no RGD → validate_rgd returns false (not applicable).
-        assert!(!r.validate_rgd().expect("validate_rgd"));
     }
 
     #[test]
@@ -3448,18 +2820,6 @@ mod tests {
         let mut buf = [0u8; 512];
         let err = r.read(&mut buf).expect_err("unsupported nibble must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn sesparse_check_integrity_flags_grain_past_eof() {
-        // GTE points to an allocated grain index far beyond the file.
-        let mut r = VmdkReader::open(Cursor::new(sesparse_with_gte0(
-            0x3000_0000_00ff_ffff, // allocated nibble + huge grain index
-        )))
-        .expect("open");
-        let rep = r.check_integrity().expect("integrity");
-        assert!(!rep.is_ok());
-        assert_eq!(rep.out_of_bounds_grains, 1);
     }
 
     #[test]
@@ -3530,39 +2890,6 @@ mod tests {
         v
     }
 
-    /// Patch the seSparse grain directory entry (GD[0] at sector 2) to `gd`.
-    fn sesparse_with_gd0(gd: u64) -> Vec<u8> {
-        let mut se = test_sesparse_vmdk(&[0xABu8; 512]);
-        let off = 2 * 512; // GD_SECTOR in testutil layout
-        se[off..off + 8].copy_from_slice(&gd.to_le_bytes());
-        se
-    }
-
-    #[test]
-    fn sesparse_zero_gd_entry_is_fully_sparse() {
-        // GD[0] = 0 → grain table absent → every method takes the unallocated path.
-        let mut r = VmdkReader::open(Cursor::new(sesparse_with_gd0(0))).expect("open");
-        assert!(!r.is_allocated(0).expect("is_allocated")); // se_read_gte None
-        r.seek(SeekFrom::Start(0)).unwrap();
-        let mut buf = [0xFFu8; 512];
-        r.read_exact(&mut buf).unwrap(); // grain_location → Sparse
-        assert_eq!(buf, [0u8; 512]);
-        assert!(r.iter_allocated_grains().expect("iter").is_empty()); // GD-0 continue
-        let rep = r.check_integrity().expect("integrity"); // GD-0 continue
-        assert!(rep.is_ok());
-        assert_eq!(rep.grains_checked, 0);
-    }
-
-    #[test]
-    fn sesparse_integrity_flags_grain_table_past_eof() {
-        // Allocated GD marker but a grain-table index far past EOF.
-        let mut r =
-            VmdkReader::open(Cursor::new(sesparse_with_gd0(0x1000_0000_00ff_ffff))).expect("open");
-        let rep = r.check_integrity().expect("integrity");
-        assert!(!rep.is_ok());
-        assert_eq!(rep.out_of_bounds_grain_tables, 1);
-    }
-
     #[test]
     fn sesparse_descriptor_without_extent_errors() {
         use std::io::Write as _;
@@ -3593,10 +2920,6 @@ mod tests {
         assert_eq!(buf, [0u8; 512]);
         // iter_allocated_grains skips both the sparse GTE and the empty GD entry.
         assert!(r.iter_allocated_grains().expect("iter").is_empty());
-        // check_integrity walks the zero-GD entry via the gt_sector==0 continue.
-        let rep = r.check_integrity().expect("integrity");
-        assert!(rep.is_ok());
-        assert_eq!(rep.grains_checked, 0);
     }
 
     #[test]

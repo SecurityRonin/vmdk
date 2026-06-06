@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 vmdk = { version = "0.4.0", path = "../vmdk" }
+vmdk-forensic = { version = "0.1.0", path = "../vmdk-forensic" }
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
