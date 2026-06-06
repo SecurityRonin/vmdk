@@ -79,9 +79,12 @@ pub(crate) fn open_cowd<R: Read + Seek>(mut reader: R) -> Result<(Vec<u32>, u64)
     reader.read_exact(&mut hdr_bytes)?;
     let hdr = CowdHeader::parse(&hdr_bytes)?;
 
-    let grain_size_bytes = u64::from(hdr.grain_size)
-        .checked_mul(SECTOR_SIZE)
-        .ok_or(VmdkError::GeometryOverflow { field: "grain_size" })?;
+    let grain_size_bytes =
+        u64::from(hdr.grain_size)
+            .checked_mul(SECTOR_SIZE)
+            .ok_or(VmdkError::GeometryOverflow {
+                field: "grain_size",
+            })?;
 
     let num_grains = u64::from(hdr.capacity).div_ceil(u64::from(hdr.grain_size));
     let num_gts = num_grains.div_ceil(COWD_GTES_PER_GT as u64);
@@ -168,7 +171,10 @@ mod tests {
         let h = make_cowd_header(1024, 0, 1);
         assert!(matches!(
             CowdHeader::parse(&h),
-            Err(VmdkError::FieldOutOfRange { field: "grain_size", .. })
+            Err(VmdkError::FieldOutOfRange {
+                field: "grain_size",
+                ..
+            })
         ));
     }
 

@@ -292,7 +292,10 @@ mod tests {
         std::fs::write(&p, &bytes).unwrap();
         assert!(matches!(
             VmdkChainReader::open(&p),
-            Err(VmdkError::FieldOutOfRange { field: "chain_depth", .. })
+            Err(VmdkError::FieldOutOfRange {
+                field: "chain_depth",
+                ..
+            })
         ));
     }
 }

@@ -230,10 +230,12 @@ impl<R: Read + Seek> VmdkReader<R> {
 
         let hdr = SparseExtentHeader::parse(&hdr_bytes)?;
 
-        let grain_size_bytes = hdr
-            .grain_size
-            .checked_mul(SECTOR_SIZE)
-            .ok_or(VmdkError::GeometryOverflow { field: "grain_size" })?;
+        let grain_size_bytes =
+            hdr.grain_size
+                .checked_mul(SECTOR_SIZE)
+                .ok_or(VmdkError::GeometryOverflow {
+                    field: "grain_size",
+                })?;
         let virtual_disk_size = hdr
             .capacity
             .checked_mul(SECTOR_SIZE)
@@ -248,15 +250,21 @@ impl<R: Read + Seek> VmdkReader<R> {
             / hdr.grain_size;
         let num_gts = num_grains
             .checked_add(u64::from(hdr.num_gtes_per_gt) - 1)
-            .ok_or(VmdkError::GeometryOverflow { field: "num_grains" })?
+            .ok_or(VmdkError::GeometryOverflow {
+                field: "num_grains",
+            })?
             / u64::from(hdr.num_gtes_per_gt);
-        let gd_byte_len = num_gts
-            .checked_mul(4)
-            .ok_or(VmdkError::GeometryOverflow { field: "gd_byte_len" })?;
+        let gd_byte_len = num_gts.checked_mul(4).ok_or(VmdkError::GeometryOverflow {
+            field: "gd_byte_len",
+        })?;
 
         const MAX_GD_BYTES: u64 = 16 * 1024 * 1024;
         if gd_byte_len > MAX_GD_BYTES {
-            return Err(VmdkError::FieldOutOfRange { field: "grain_directory", value: gd_byte_len, reason: "exceeds the 16 MiB cap" });
+            return Err(VmdkError::FieldOutOfRange {
+                field: "grain_directory",
+                value: gd_byte_len,
+                reason: "exceeds the 16 MiB cap",
+            });
         }
         // For streamOptimized, the primary header carries GD_AT_END as a sentinel;
         // the real GD offset is in the footer header at file_end − 1024 (VDF 1.1 §4.6).
@@ -867,12 +875,10 @@ impl VmdkFileReader {
                 // ESXi sparse formats: SPARSE/VMFSSPARSE extent type — binary VMDK4 or COWD.
                 "vmfsSparse" | "vmfsThin" | "twoGbMaxExtentSparse" => {
                     let multi = MultiSparseReader::open(dir, &desc.sparse_extents)?;
-                    let virtual_disk_size = desc
-                        .sparse_capacity_sectors
-                        .checked_mul(SECTOR_SIZE)
-                        .ok_or({
-                        VmdkError::GeometryOverflow { field: "capacity" }
-                    })?;
+                    let virtual_disk_size =
+                        desc.sparse_capacity_sectors
+                            .checked_mul(SECTOR_SIZE)
+                            .ok_or(VmdkError::GeometryOverflow { field: "capacity" })?;
                     Ok(VmdkReader {
                         inner: Box::new(multi) as Box<dyn ReadSeek + Send>,
                         fmt: FormatState::Flat,
@@ -892,9 +898,12 @@ impl VmdkFileReader {
                 }
                 // seSparse: a single binary extent whose CAFEBABE magic selects the reader.
                 "seSparse" => {
-                    let entry = desc.sparse_extents.first().ok_or({
-                        VmdkError::MalformedDescriptor("seSparse createType without a SESPARSE extent")
-                    })?;
+                    let entry =
+                        desc.sparse_extents
+                            .first()
+                            .ok_or(VmdkError::MalformedDescriptor(
+                                "seSparse createType without a SESPARSE extent",
+                            ))?;
                     let extent_path = dir.join(entry.filename.as_ref());
                     let file = BufReader::new(File::open(&extent_path)?);
                     Ok(VmdkReader::open(file)?.into_file_reader())
@@ -906,9 +915,7 @@ impl VmdkFileReader {
                         let virtual_disk_size = desc
                             .capacity_sectors
                             .checked_mul(SECTOR_SIZE)
-                            .ok_or({
-                                VmdkError::GeometryOverflow { field: "capacity" }
-                            })?;
+                            .ok_or(VmdkError::GeometryOverflow { field: "capacity" })?;
                         Ok(VmdkReader {
                             inner: Box::new(multi) as Box<dyn ReadSeek + Send>,
                             fmt: FormatState::Flat,
@@ -930,9 +937,7 @@ impl VmdkFileReader {
                         let virtual_disk_size = desc
                             .sparse_capacity_sectors
                             .checked_mul(SECTOR_SIZE)
-                            .ok_or({
-                                VmdkError::GeometryOverflow { field: "capacity" }
-                            })?;
+                            .ok_or(VmdkError::GeometryOverflow { field: "capacity" })?;
                         Ok(VmdkReader {
                             inner: Box::new(multi) as Box<dyn ReadSeek + Send>,
                             fmt: FormatState::Flat,
@@ -950,7 +955,9 @@ impl VmdkFileReader {
                             rgd_recovery_count: 0,
                         })
                     } else {
-                        Err(VmdkError::MalformedDescriptor("custom createType without recognised extents"))
+                        Err(VmdkError::MalformedDescriptor(
+                            "custom createType without recognised extents",
+                        ))
                     }
                 }
                 _ => Err(VmdkError::UnsupportedDiskType(
@@ -2420,7 +2427,10 @@ mod tests {
         let img = vmdk_header_bytes(1_000_000_000_000, 8, 512);
         assert!(matches!(
             VmdkReader::open(Cursor::new(img)),
-            Err(VmdkError::FieldOutOfRange { field: "grain_directory", .. })
+            Err(VmdkError::FieldOutOfRange {
+                field: "grain_directory",
+                ..
+            })
         ));
     }
 

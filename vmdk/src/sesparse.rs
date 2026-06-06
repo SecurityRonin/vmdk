@@ -208,7 +208,10 @@ mod tests {
         h[24..32].copy_from_slice(&16u64.to_le_bytes()); // grain_size=16, not 8
         assert!(matches!(
             SeConstHeader::parse(&h),
-            Err(VmdkError::FieldOutOfRange { field: "grain_size", .. })
+            Err(VmdkError::FieldOutOfRange {
+                field: "grain_size",
+                ..
+            })
         ));
     }
 
@@ -226,7 +229,10 @@ mod tests {
         h[32..40].copy_from_slice(&128u64.to_le_bytes()); // grain_table_size=128, not 64
         assert!(matches!(
             SeConstHeader::parse(&h),
-            Err(VmdkError::FieldOutOfRange { field: "grain_table_size", .. })
+            Err(VmdkError::FieldOutOfRange {
+                field: "grain_table_size",
+                ..
+            })
         ));
     }
 
@@ -236,7 +242,10 @@ mod tests {
         let h = make_sesparse_header(100_000_000_000);
         assert!(matches!(
             open_sesparse(std::io::Cursor::new(h)),
-            Err(VmdkError::FieldOutOfRange { field: "grain_directory", .. })
+            Err(VmdkError::FieldOutOfRange {
+                field: "grain_directory",
+                ..
+            })
         ));
     }
 }

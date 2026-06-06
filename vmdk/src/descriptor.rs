@@ -83,9 +83,7 @@ pub(crate) fn parse_text_descriptor(text: &str) -> Result<TextDescriptor> {
         if let Some(ext) = try_parse_sparse_extent(line) {
             sparse_capacity_sectors = sparse_capacity_sectors
                 .checked_add(ext.size_sectors)
-                .ok_or({
-                    VmdkError::GeometryOverflow { field: "capacity" }
-                })?;
+                .ok_or(VmdkError::GeometryOverflow { field: "capacity" })?;
             sparse_extents.push(ext);
         }
     }
