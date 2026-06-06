@@ -2500,6 +2500,21 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_extent_path_cannot_escape_image_directory() {
+        // A crafted descriptor must not be able to read files outside the image
+        // directory via an absolute or `..`-climbing extent path.
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::write(outer.path().join("secret.bin"), vec![0u8; 1024]).unwrap();
+        let img = outer.path().join("img");
+        std::fs::create_dir(&img).unwrap();
+        let desc = "# Disk DescriptorFile\nversion=1\nCID=ffffffff\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\nRW 2 FLAT \"../secret.bin\" 0\n";
+        let desc_path = img.join("disk.vmdk");
+        std::fs::write(&desc_path, desc.as_bytes()).unwrap();
+        // The extent path escapes the image directory — opening it must be refused.
+        assert!(VmdkFileReader::open_path(&desc_path).is_err());
+    }
+
+    #[test]
     fn custom_create_type_with_mixed_extents_errors() {
         // A `custom` descriptor listing BOTH a flat and a sparse extent must fail
         // loud rather than silently using only the flat extents and dropping the
