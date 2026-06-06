@@ -2494,6 +2494,21 @@ mod tests {
     }
 
     #[test]
+    fn custom_create_type_with_mixed_extents_errors() {
+        // A `custom` descriptor listing BOTH a flat and a sparse extent must fail
+        // loud rather than silently using only the flat extents and dropping the
+        // sparse ones (silent wrong output / under-reported capacity).
+        let dir = tempfile::tempdir().unwrap();
+        let desc = "# Disk DescriptorFile\nversion=1\nCID=ffffffff\nparentCID=ffffffff\ncreateType=\"custom\"\nRW 2048 FLAT \"flat.bin\" 0\nRW 2048 SPARSE \"sparse.vmdk\"\n";
+        let desc_path = dir.path().join("disk.vmdk");
+        std::fs::write(&desc_path, desc.as_bytes()).unwrap();
+        assert!(matches!(
+            VmdkFileReader::open_path(&desc_path),
+            Err(VmdkError::MalformedDescriptor(_))
+        ));
+    }
+
+    #[test]
     fn open_path_rejects_unknown_create_type() {
         let dir = tempfile::tempdir().unwrap();
         let desc = "# Disk DescriptorFile\nversion=1\nCID=ffffffff\nparentCID=ffffffff\ncreateType=\"someFutureFormat\"\n";
