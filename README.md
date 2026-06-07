@@ -10,51 +10,54 @@ Pure-Rust, read-only reader for VMware VMDK disk images. Presents the virtual di
 
 ## Command-line tool
 
+One command — no subcommand — tells you what a VMDK is and whether it's sound:
+
 ```console
-$ cargo run --bin vmdk -- info disk.vmdk
+$ vmdk disk.vmdk
 ```
 
 ```text
 File:              disk.vmdk
 Format:            VMDK v1 (monolithicSparse)
 Virtual disk size: 4,194,304 bytes (4.00 MiB)
-Sector size:       512 bytes
 Sectors:           8,192
-Grain size:        128 sectors (64 KiB)
-Compressed:        no
 CID:               dc80b6c7
-Descriptor:        17 lines (see --descriptor)
+
+Provenance:
+  Content ID:       dc80b6c7
+  Adapter:          ide
+  Geometry (C/H/S): 8/16/63
+  HW version:       4
+  Clean shutdown:   yes
+  Redundant GD:     present
+
+Integrity: OK (no anomalies detected)
 ```
 
-Six subcommands — `info`, `map`, `dump`, `hash`, `verify`, `diff` — fold the
-common `qemu-img` workflows into one binary:
+The default `examine` view folds identity, `ddb` provenance, companion-file
+discovery, and the canonical forensic findings — RGD mismatch, dangling grain
+tables, unclean shutdown, FTP-mangled headers — into one answer, and **exits
+non-zero on any High-severity finding**, so it drops straight into a triage
+pipeline. Three flags extend it:
+
+- `--fingerprint` (`--fp`) — append a labelled virtual-disk SHA-256 + MD5
+- `--json` — machine-readable output for a SIEM / pipeline
+- `--recover` — read through a damaged primary grain directory (RGD fallback)
 
 ```console
-$ vmdk verify disk.vmdk
-RGD:     OK (matches primary GD)
-Allocated grains: 3 (196,608 bytes)
-Integrity: OK (3 grains checked, no out-of-bounds pointers)
-Status:  OK
+$ vmdk --fingerprint --json disk.vmdk | jq '.findings, .fingerprint'
 ```
 
-`dump`, `hash`, `map`, and `verify` accept `--recover`: when the primary grain
-directory is damaged, the read is resolved through the redundant grain directory
-instead, so data behind the corruption is still extractable.
+Three more verbs cover extraction and comparison:
 
-```console
-$ vmdk verify damaged.vmdk            # primary GD is corrupt
-Integrity: FAIL — 1 out-of-bounds grain table(s) … Status: FAILED
-
-$ vmdk verify --recover damaged.vmdk  # resolve through the redundant GD
-Integrity: OK (1 grains checked, no out-of-bounds pointers)
-Recovered 1 grain(s) via the redundant grain directory
-Status:  OK
-```
-
-`dump` writes raw virtual-disk bytes to stdout or a file (`-o`), a byte range
-(`--offset` / `--length`), or a hex view (`--hex`) — pipe it straight into a
-filesystem tool (NTFS, ext4, …) to read the guest's files. `verify` exits `0`
-when clean and `1` on corruption, so it drops into a triage pipeline.
+- `dump` — raw virtual-disk bytes to stdout or a file (`-o`), a byte range
+  (`--offset` / `--length`), a hex view (`--hex`), or a sparse-only
+  reconstruction (`--allocated-only`). `dump --recover` resolves reads through
+  the redundant grain directory, extracting data behind corruption that
+  `qemu-img` fails on — pipe it into a filesystem tool (NTFS, ext4, …) to read
+  the guest's files.
+- `map` — allocated (non-sparse) grain ranges as `start_lba,sector_count`
+- `diff` — byte-by-byte comparison of two VMDK virtual disks
 
 ## Rust library
 
