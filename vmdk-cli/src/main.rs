@@ -531,6 +531,32 @@ fn cmd_verify(path: &std::path::Path, recover: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ── examine (default view) ─────────────────────────────────────────────────────
+
+/// The rendered `examine` report plus its pass/fail verdict.
+///
+/// `failed` is true when any forensic finding is graded `High` or above (or the
+/// structural analysis could not complete) — the examiner-facing equivalent of a
+/// non-zero exit code, computed once so both the text and the process status agree.
+struct ExamineReport {
+    text: String,
+    failed: bool,
+}
+
+/// Build the one-shot `examine` view: identity, forensic findings, and a verdict.
+///
+/// This is the no-subcommand default — the fast triage answer to "what is this and
+/// is it sound?". It opens headers/metadata only (instant even on a huge image);
+/// the expensive full-disk fingerprint is a separate opt-in.
+fn examine_report(path: &std::path::Path) -> Result<ExamineReport, String> {
+    // RED stub — replaced by the real implementation in the GREEN commit.
+    let _ = path;
+    Ok(ExamineReport {
+        text: String::new(),
+        failed: false,
+    })
+}
+
 // ── diff ──────────────────────────────────────────────────────────────────────
 
 fn cmd_diff(a: &std::path::Path, b: &std::path::Path) -> ExitCode {
@@ -975,6 +1001,48 @@ mod tests {
 
         let mut src2 = std::io::Cursor::new(vec![9u8, 8, 7]);
         dump_hex(&mut src2, 0, 10).expect("dump_hex stops at short read");
+    }
+
+    // ── examine (default view) ──────────────────────────────────────────────
+
+    #[test]
+    fn examine_clean_image_shows_identity_and_passes() {
+        let r = examine_report(&data("dfvfs_ext2.vmdk")).expect("examine a clean image");
+        assert!(!r.failed, "a clean image is not a failure: {}", r.text);
+        assert!(
+            r.text.contains("VMDK"),
+            "report states the format: {}",
+            r.text
+        );
+        assert!(
+            r.text.to_lowercase().contains("integrity")
+                || r.text.to_lowercase().contains("no anomalies"),
+            "report carries an integrity verdict: {}",
+            r.text
+        );
+    }
+
+    #[test]
+    fn examine_fails_and_names_finding_on_high_severity_anomaly() {
+        // GD[0] points to a grain table past EOF → DanglingGrainTable (High).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dangling.vmdk");
+        std::fs::write(&p, opens_but_gt_and_rgd_dangle()).unwrap();
+        let r = examine_report(&p).expect("examine opens the image");
+        assert!(r.failed, "a High-severity anomaly fails the verdict: {}", r.text);
+        assert!(
+            r.text.contains("VMDK-DANGLING") || r.text.to_uppercase().contains("DANGLING"),
+            "the finding code is surfaced to the examiner: {}",
+            r.text
+        );
+    }
+
+    #[test]
+    fn examine_errors_on_unopenable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = dir.path().join("g.bin");
+        std::fs::write(&g, b"not a vmdk").unwrap();
+        assert!(examine_report(&g).is_err(), "garbage input is an error");
     }
 
     #[test]
