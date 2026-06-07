@@ -49,6 +49,9 @@ struct Cli {
     /// Emit machine-readable JSON instead of the human-readable report.
     #[arg(long, global = true)]
     json: bool,
+    /// Read through the redundant grain directory when the primary GD is damaged.
+    #[arg(long)]
+    recover: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -562,6 +565,9 @@ struct ExamineOpts {
     fingerprint: bool,
     /// Emit machine-readable JSON instead of the human-readable report.
     json: bool,
+    /// Read through the redundant grain directory when the primary GD is damaged
+    /// (so the fingerprint can complete on a recoverable image).
+    recover: bool,
 }
 
 /// Build the one-shot `examine` view: identity, forensic findings, and a verdict.
@@ -570,6 +576,7 @@ struct ExamineOpts {
 /// is it sound?". It opens headers/metadata only (instant even on a huge image);
 /// the expensive full-disk fingerprint is a separate opt-in.
 fn examine_report(path: &std::path::Path, opts: ExamineOpts) -> Result<ExamineReport, String> {
+    let _ = opts.recover; // RED stub — RGD fallback wired in the GREEN commit.
     let mut reader = open(path)?;
     let info = reader.info();
     let file_name = path
@@ -937,6 +944,7 @@ fn main() -> ExitCode {
                 ExamineOpts {
                     fingerprint: cli.fingerprint,
                     json: cli.json,
+                    recover: cli.recover,
                 },
             ),
             None => fail("error: provide a VMDK image to examine, or a subcommand (see --help)"),
@@ -1371,6 +1379,7 @@ mod tests {
             ExamineOpts {
                 json: true,
                 fingerprint: true,
+                ..Default::default()
             },
         )
         .expect("examine --json --fp");
@@ -1381,6 +1390,47 @@ mod tests {
                 .is_some(),
             "fingerprint.sha256 present: {}",
             r.text
+        );
+    }
+
+    #[test]
+    fn examine_fingerprint_recover_completes_on_damaged_primary_gd() {
+        // Primary GD pointer damaged but RGD-recoverable: --fp alone can't hash the
+        // disk (the read fails); --fp --recover reads through the RGD and completes.
+        let dir = tempfile::tempdir().unwrap();
+        let mut vmdk = vmdk::testutil::test_sparse_vmdk(&[0xAB; 512]);
+        let gd = 21 * 512;
+        vmdk[gd..gd + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let p = dir.path().join("corrupt.vmdk");
+        std::fs::write(&p, &vmdk).unwrap();
+
+        let without = examine_report(
+            &p,
+            ExamineOpts {
+                fingerprint: true,
+                ..Default::default()
+            },
+        )
+        .expect("examine opens");
+        assert!(
+            without.text.contains("fingerprint: ERROR"),
+            "without --recover the fingerprint cannot complete: {}",
+            without.text
+        );
+
+        let with = examine_report(
+            &p,
+            ExamineOpts {
+                fingerprint: true,
+                recover: true,
+                ..Default::default()
+            },
+        )
+        .expect("examine --recover opens");
+        assert!(
+            with.text.contains("SHA-256"),
+            "--recover lets the fingerprint complete via the RGD: {}",
+            with.text
         );
     }
 
