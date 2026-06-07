@@ -1121,6 +1121,41 @@ mod tests {
     }
 
     #[test]
+    fn examine_surfaces_provenance() {
+        // The examine view must carry the who/what/when an examiner needs: an
+        // effective content ID and the header provenance flags (unclean shutdown,
+        // FTP-mangling, redundant GD).
+        let r = examine_report(&data("dfvfs_ext2.vmdk")).expect("examine");
+        assert!(
+            r.text.contains("Provenance"),
+            "has a provenance section: {}",
+            r.text
+        );
+        assert!(
+            r.text.contains("Content ID"),
+            "shows the effective content ID: {}",
+            r.text
+        );
+    }
+
+    #[test]
+    fn examine_lists_companion_files() {
+        // flat.vmdk references flat-f001.vmdk — an acquisition handler must see
+        // exactly which companion files to collect.
+        let r = examine_report(&data("flat.vmdk")).expect("examine multi-file");
+        assert!(
+            r.text.to_lowercase().contains("companion"),
+            "lists companion files: {}",
+            r.text
+        );
+        assert!(
+            r.text.contains("flat-f001"),
+            "names the required extent file: {}",
+            r.text
+        );
+    }
+
+    #[test]
     fn cmd_examine_exit_code_tracks_verdict() {
         // Clean image → success; dangling metadata → failure; garbage → failure.
         assert!(is_success(cmd_examine(&data("dfvfs_ext2.vmdk"))));
