@@ -59,6 +59,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Show image metadata; --descriptor dumps the raw descriptor, --chain walks the snapshot chain
+    /// (superseded by the default `vmdk FILE` examine view; kept for back-compat)
+    #[command(hide = true)]
     Info {
         path: PathBuf,
         /// Print the raw embedded text descriptor instead of the summary
@@ -102,6 +104,8 @@ enum Command {
     },
 
     /// Compute SHA-256 and MD5 of the full virtual disk (one streaming pass)
+    /// (superseded by `vmdk FILE --fingerprint`; kept for back-compat)
+    #[command(hide = true)]
     Hash {
         path: PathBuf,
         /// Recover via the redundant grain directory when the primary GD is damaged
@@ -110,6 +114,8 @@ enum Command {
     },
 
     /// Verify structural integrity: RGD validation + allocation scan
+    /// (superseded by the default `vmdk FILE` examine view; kept for back-compat)
+    #[command(hide = true)]
     Verify {
         path: PathBuf,
         /// Recover via the redundant grain directory and report post-recovery integrity
