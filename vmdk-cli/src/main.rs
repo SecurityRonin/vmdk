@@ -35,11 +35,15 @@ fn open(path: &std::path::Path) -> Result<VmdkFileReader, String> {
                   seSparse (VMFS6), and snapshot chains.\n\n\
                   VMDK is a block container — it stores raw disk sectors, not files. \
                   To extract individual files, pipe `dump` output (or VmdkReader) into a \
-                  filesystem tool that understands the guest filesystem (NTFS, ext4, …)."
+                  filesystem tool that understands the guest filesystem (NTFS, ext4, …).",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    /// VMDK image to examine — the default action when no subcommand is given
+    /// (identity, forensic findings, and an integrity verdict in one shot).
+    path: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -549,12 +553,86 @@ struct ExamineReport {
 /// is it sound?". It opens headers/metadata only (instant even on a huge image);
 /// the expensive full-disk fingerprint is a separate opt-in.
 fn examine_report(path: &std::path::Path) -> Result<ExamineReport, String> {
-    // RED stub — replaced by the real implementation in the GREEN commit.
-    let _ = path;
-    Ok(ExamineReport {
-        text: String::new(),
-        failed: false,
-    })
+    use std::fmt::Write as _;
+
+    let reader = open(path)?;
+    let info = reader.info();
+    let mut text = String::new();
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mib = info.virtual_disk_size as f64 / (1024.0 * 1024.0);
+
+    let _ = writeln!(text, "File:              {file_name}");
+    let _ = writeln!(
+        text,
+        "Format:            VMDK v{} ({})",
+        info.version, info.disk_type
+    );
+    let _ = writeln!(
+        text,
+        "Virtual disk size: {} bytes ({mib:.2} MiB)",
+        fmt_commas(info.virtual_disk_size)
+    );
+    let _ = writeln!(text, "Sectors:           {}", fmt_commas(info.sector_count));
+    if info.cid != 0xffff_ffff {
+        let _ = writeln!(text, "CID:               {:08x}", info.cid);
+    }
+    if info.parent_cid != 0xffff_ffff {
+        let _ = writeln!(text, "Parent CID:        {:08x}", info.parent_cid);
+    }
+
+    // Forensic findings come from vmdk-forensic, which reparses the raw image.
+    // An analysis error is itself a failed verdict — surfaced, never swallowed.
+    let mut failed = false;
+    let findings = match std::fs::File::open(path) {
+        Ok(f) => match vmdk_forensic::VmdkIntegrity::new(f).analyse() {
+            Ok(v) => v,
+            Err(e) => {
+                failed = true;
+                let _ = writeln!(text, "\nIntegrity: ERROR — {e}");
+                Vec::new()
+            }
+        },
+        Err(e) => return Err(format!("error: {e}")),
+    };
+
+    if findings.is_empty() {
+        if !failed {
+            let _ = writeln!(text, "\nIntegrity: OK (no anomalies detected)");
+        }
+    } else {
+        let _ = writeln!(text, "\nFindings ({}):", findings.len());
+        for fnd in &findings {
+            let sev = fnd
+                .severity
+                .map_or_else(|| "—".to_string(), |s| s.to_string());
+            let _ = writeln!(text, "  [{sev}] {} — {}", fnd.code, fnd.note);
+            if fnd.severity >= Some(forensicnomicon::report::Severity::High) {
+                failed = true;
+            }
+        }
+    }
+
+    Ok(ExamineReport { text, failed })
+}
+
+/// Print the `examine` report and map its verdict to an exit code: a `High`+
+/// finding (or a failed analysis) yields failure, so scripts get a pass/fail
+/// signal for free without a separate command.
+fn cmd_examine(path: &std::path::Path) -> ExitCode {
+    match examine_report(path) {
+        Ok(report) => {
+            print!("{}", report.text);
+            if report.failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(m) => fail(m),
+    }
 }
 
 // ── diff ──────────────────────────────────────────────────────────────────────
@@ -616,23 +694,28 @@ fn cmd_diff(a: &std::path::Path, b: &std::path::Path) -> ExitCode {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match &cli.command {
-        Command::Info {
+        Some(Command::Info {
             path,
             descriptor,
             chain,
-        } => cmd_info(path, *descriptor, *chain),
-        Command::Map { path, recover } => cmd_map(path, *recover),
-        Command::Dump {
+        }) => cmd_info(path, *descriptor, *chain),
+        Some(Command::Map { path, recover }) => cmd_map(path, *recover),
+        Some(Command::Dump {
             path,
             output,
             offset,
             length,
             hex,
             recover,
-        } => cmd_dump(path, output.as_deref(), *offset, *length, *hex, *recover),
-        Command::Hash { path, recover } => cmd_hash(path, *recover),
-        Command::Verify { path, recover } => cmd_verify(path, *recover),
-        Command::Diff { a, b } => cmd_diff(a, b),
+        }) => cmd_dump(path, output.as_deref(), *offset, *length, *hex, *recover),
+        Some(Command::Hash { path, recover }) => cmd_hash(path, *recover),
+        Some(Command::Verify { path, recover }) => cmd_verify(path, *recover),
+        Some(Command::Diff { a, b }) => cmd_diff(a, b),
+        // No subcommand → examine the given image (the default triage view).
+        None => match cli.path.as_deref() {
+            Some(path) => cmd_examine(path),
+            None => fail("error: provide a VMDK image to examine, or a subcommand (see --help)"),
+        },
     }
 }
 
@@ -1035,6 +1118,19 @@ mod tests {
             "the finding code is surfaced to the examiner: {}",
             r.text
         );
+    }
+
+    #[test]
+    fn cmd_examine_exit_code_tracks_verdict() {
+        // Clean image → success; dangling metadata → failure; garbage → failure.
+        assert!(is_success(cmd_examine(&data("dfvfs_ext2.vmdk"))));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dangling.vmdk");
+        std::fs::write(&p, opens_but_gt_and_rgd_dangle()).unwrap();
+        assert!(!is_success(cmd_examine(&p)), "High-severity finding → failure");
+        let g = dir.path().join("g.bin");
+        std::fs::write(&g, b"nope").unwrap();
+        assert!(!is_success(cmd_examine(&g)), "garbage → failure");
     }
 
     #[test]

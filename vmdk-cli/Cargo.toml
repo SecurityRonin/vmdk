@@ -17,6 +17,9 @@ path = "src/main.rs"
 [dependencies]
 vmdk = { version = "0.6.0", path = "../vmdk" }
 vmdk-forensic = { version = "0.6.0", path = "../vmdk-forensic" }
+# Canonical reporting vocabulary (Severity/Finding/Category) — every fleet crate
+# that touches reporting depends on forensicnomicon directly, the single source of truth.
+forensicnomicon = { version = "0.3.0", path = "../../forensicnomicon" }
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
