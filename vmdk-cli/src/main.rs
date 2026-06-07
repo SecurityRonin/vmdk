@@ -95,6 +95,10 @@ enum Command {
         /// Recover via the redundant grain directory when the primary GD is damaged
         #[arg(long)]
         recover: bool,
+        /// Write only allocated grains, leaving unallocated regions as file holes
+        /// (a sparse reconstruction). Requires --output (a seekable file).
+        #[arg(long)]
+        allocated_only: bool,
     },
 
     /// Compute SHA-256 and MD5 of the full virtual disk (one streaming pass)
@@ -284,6 +288,7 @@ fn recovery_note(count: u64) -> Option<String> {
     (count > 0).then(|| format!("Recovered {count} grain(s) via the redundant grain directory"))
 }
 
+#[allow(clippy::fn_params_excessive_bools)] // matches the Dump subcommand's flag set
 fn cmd_dump(
     path: &std::path::Path,
     output: Option<&std::path::Path>,
@@ -291,7 +296,9 @@ fn cmd_dump(
     length: Option<u64>,
     hex: bool,
     recover: bool,
+    allocated_only: bool,
 ) -> ExitCode {
+    let _ = allocated_only; // RED stub — sparse export wired in the GREEN commit.
     let mut reader = match open(path) {
         Ok(r) => r,
         Err(m) => return fail(m),
@@ -937,7 +944,16 @@ fn main() -> ExitCode {
             length,
             hex,
             recover,
-        }) => cmd_dump(path, output.as_deref(), *offset, *length, *hex, *recover),
+            allocated_only,
+        }) => cmd_dump(
+            path,
+            output.as_deref(),
+            *offset,
+            *length,
+            *hex,
+            *recover,
+            *allocated_only,
+        ),
         Some(Command::Hash { path, recover }) => cmd_hash(path, *recover),
         Some(Command::Verify { path, recover }) => cmd_verify(path, *recover),
         Some(Command::Diff { a, b }) => cmd_diff(a, b),
@@ -1057,8 +1073,16 @@ mod tests {
         assert!(is_success(cmd_map(&p, false)));
         assert!(is_success(cmd_hash(&p, false)));
         assert!(is_success(cmd_verify(&p, false)));
-        assert!(is_success(cmd_dump(&p, None, 0, Some(64), false, false))); // stdout range
-        assert!(is_success(cmd_dump(&p, None, 1024, Some(20), true, false))); // hex partial row
+        assert!(is_success(cmd_dump(&p, None, 0, Some(64), false, false, false))); // stdout range
+        assert!(is_success(cmd_dump(
+            &p,
+            None,
+            1024,
+            Some(20),
+            true,
+            false,
+            false
+        ))); // hex partial row
         assert!(is_success(cmd_diff(&p, &p))); // identical
     }
 
@@ -1085,11 +1109,56 @@ mod tests {
             cmd_map(&garbage, false),
             cmd_hash(&garbage, false),
             cmd_verify(&garbage, false),
-            cmd_dump(&garbage, None, 0, None, false, false),
+            cmd_dump(&garbage, None, 0, None, false, false, false),
             cmd_diff(&garbage, &garbage),
         ] {
             assert!(!is_success(code), "garbage input must fail");
         }
+    }
+
+    #[test]
+    fn dump_allocated_only_writes_sparse_full_size_image() {
+        let dir = tempfile::tempdir().unwrap();
+        // minimal.vmdk is all-sparse: --allocated-only writes a full-size file whose
+        // unallocated regions are holes (no data blocks), not written-out zeros.
+        let out = dir.path().join("sparse.raw");
+        assert!(is_success(cmd_dump(
+            &data("minimal.vmdk"),
+            Some(&out),
+            0,
+            None,
+            false,
+            false,
+            true
+        )));
+        let meta = std::fs::metadata(&out).unwrap();
+        assert_eq!(meta.len(), 1_048_576, "output is the full virtual-disk size");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert!(
+                meta.blocks() * 512 < meta.len(),
+                "unallocated regions are file holes (sparse): {} blocks for {} bytes",
+                meta.blocks(),
+                meta.len()
+            );
+        }
+
+        // An allocated grain is still written at its offset.
+        let p2 = dir.path().join("data.vmdk");
+        std::fs::write(&p2, vmdk::testutil::test_sparse_vmdk(&[0xAB; 512])).unwrap();
+        let out2 = dir.path().join("data.raw");
+        assert!(is_success(cmd_dump(
+            &p2,
+            Some(&out2),
+            0,
+            None,
+            false,
+            false,
+            true
+        )));
+        let d = std::fs::read(&out2).unwrap();
+        assert_eq!(&d[..512], &[0xAB; 512], "allocated grain bytes present");
     }
 
     #[test]
@@ -1102,6 +1171,7 @@ mod tests {
             0,
             None,
             false,
+            false,
             false
         )));
         assert_eq!(std::fs::metadata(&ok).unwrap().len(), 1_048_576);
@@ -1112,6 +1182,7 @@ mod tests {
             Some(bad),
             0,
             None,
+            false,
             false,
             false
         )));
@@ -1212,7 +1283,7 @@ mod tests {
         let p = dir.path().join("corrupt.vmdk");
         std::fs::write(&p, &vmdk).unwrap();
         // hex + recover → recovers a grain → prints the recovery note (covers that branch)
-        assert!(is_success(cmd_dump(&p, None, 0, Some(512), true, true)));
+        assert!(is_success(cmd_dump(&p, None, 0, Some(512), true, true, false)));
     }
 
     #[test]
@@ -1230,13 +1301,13 @@ mod tests {
 
         // Without recovery the dangling primary pointer makes the read fail.
         assert!(
-            !is_success(cmd_dump(&p, Some(&out), 0, Some(512), false, false)),
+            !is_success(cmd_dump(&p, Some(&out), 0, Some(512), false, false, false)),
             "dump without --recover must fail on the damaged primary GD"
         );
 
         // With recovery the grain is read through the RGD.
         assert!(
-            is_success(cmd_dump(&p, Some(&out), 0, Some(512), false, true)),
+            is_success(cmd_dump(&p, Some(&out), 0, Some(512), false, true, false)),
             "dump --recover must extract via the redundant GD"
         );
         let data = std::fs::read(&out).unwrap();
