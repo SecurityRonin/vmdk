@@ -559,8 +559,7 @@ struct ExamineReport {
 fn examine_report(path: &std::path::Path, fingerprint: bool) -> Result<ExamineReport, String> {
     use std::fmt::Write as _;
 
-    let _ = fingerprint; // RED stub — fingerprint section added in the GREEN commit.
-    let reader = open(path)?;
+    let mut reader = open(path)?;
     let info = reader.info();
     let mut text = String::new();
     let file_name = path
@@ -690,6 +689,24 @@ fn examine_report(path: &std::path::Path, fingerprint: bool) -> Result<ExamineRe
             let _ = writeln!(text, "  [{sev}] {} — {}", fnd.code, fnd.note);
             if fnd.severity >= Some(forensicnomicon::report::Severity::High) {
                 failed = true;
+            }
+        }
+    }
+
+    // Virtual-disk content fingerprint (opt-in: reads the whole disk). Labelled
+    // explicitly so a custody manifest can't confuse it with the container file or
+    // per-extent artifact hashes.
+    if fingerprint {
+        reader.seek(SeekFrom::Start(0)).ok();
+        match reader.hash() {
+            Ok(d) => {
+                let _ = writeln!(text, "\nVirtual-disk content fingerprint:");
+                let _ = writeln!(text, "  SHA-256  {}", d.sha256);
+                let _ = writeln!(text, "  MD5      {}", d.md5);
+            }
+            Err(e) => {
+                failed = true;
+                let _ = writeln!(text, "\nVirtual-disk content fingerprint: ERROR — {e}");
             }
         }
     }
