@@ -245,21 +245,30 @@ pub(crate) fn decode_descriptor(bytes: &[u8]) -> String {
 
     // The `ddb.encoding` declaration is itself ASCII, so it survives a lossy pass
     // and can be read even when the body bytes are not valid UTF-8.
-    if declared_encoding(&String::from_utf8_lossy(bytes))
-        .is_some_and(|e| e.eq_ignore_ascii_case("windows-1252"))
-    {
+    let label = declared_encoding(&String::from_utf8_lossy(bytes));
+    decode_bytes(bytes, label.as_deref())
+}
+
+/// Default decoder (no `full-encoding` feature): UTF-8 + windows-1252, dependency-free.
+/// Any other declared encoding degrades to lossy UTF-8 (U+FFFD) rather than dropping
+/// the descriptor — fail visible, not silent. Enable `full-encoding` for the full set
+/// (`Shift_JIS` / `GBK` / `Big5` / …) via `encoding_rs`.
+#[cfg(not(feature = "full-encoding"))]
+fn decode_bytes(bytes: &[u8], label: Option<&str>) -> String {
+    if label.is_some_and(|e| e.eq_ignore_ascii_case("windows-1252")) {
         return decode_windows_1252(bytes);
     }
-
-    // UTF-8 (declared or default). Decode lossily on invalid input so a bad byte
-    // becomes U+FFFD rather than dropping the whole descriptor — fail visible, not
-    // silent. (Non-UTF-8 encodings other than windows-1252 — Shift_JIS/GBK/Big5 —
-    // degrade to lossy here rather than mojibake; full support would need a
-    // multibyte codec dependency.)
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_owned(),
         Err(_) => String::from_utf8_lossy(bytes).into_owned(),
     }
+}
+
+/// RED stub for the `full-encoding` path — replaced by the `encoding_rs` decoder in
+/// the GREEN commit. Falls back to lossy so the `Shift_JIS` test fails.
+#[cfg(feature = "full-encoding")]
+fn decode_bytes(bytes: &[u8], _label: Option<&str>) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// The value of a `…encoding … = "<label>"` line, if the descriptor declares one.
@@ -277,6 +286,7 @@ fn declared_encoding(text: &str) -> Option<String> {
 /// Decode windows-1252 (CP-1252) bytes. 0x00–0x7F are ASCII and 0xA0–0xFF map to
 /// U+00A0–U+00FF (Latin-1); 0x80–0x9F carry the CP-1252-specific punctuation
 /// (undefined slots map to their C1 control code point, matching the WHATWG table).
+#[cfg(not(feature = "full-encoding"))]
 fn decode_windows_1252(bytes: &[u8]) -> String {
     const C1: [char; 32] = [
         '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
@@ -325,6 +335,17 @@ mod tests {
     fn decode_valid_utf8_unchanged() {
         let s = decode_descriptor("createType=\"x\"\nlabel=café\n".as_bytes());
         assert!(s.contains("café"), "valid UTF-8 round-trips: {s:?}");
+    }
+
+    #[cfg(feature = "full-encoding")]
+    #[test]
+    fn decode_shift_jis_with_full_encoding_feature() {
+        // Shift_JIS bytes 0x82 0xA0 = あ (U+3042). Multibyte — only the
+        // `full-encoding` (encoding_rs) path can decode it; the default build
+        // degrades to lossy. Guarded so it only runs when the feature is enabled.
+        let bytes = b"createType=\"monolithicFlat\"\nddb.encoding = \"shift_jis\"\nname=\x82\xA0\n";
+        let s = decode_descriptor(bytes);
+        assert!(s.contains('\u{3042}'), "Shift_JIS あ decoded: {s:?}");
     }
 
     #[test]

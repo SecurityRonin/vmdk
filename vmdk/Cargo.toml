@@ -17,6 +17,9 @@ exclude      = ["tests/data/", "fuzz/"]
 [features]
 test-helpers = []
 serde = ["dep:serde"]
+# Full multibyte descriptor decoding (Shift_JIS / GBK / Big5 / …) via `encoding_rs`.
+# Off by default — the default build decodes UTF-8 + windows-1252 dependency-free.
+full-encoding = []
 # Forward internal diagnostics to the `tracing` ecosystem for structured,
 # level-filtered debugging over untrusted images. Off by default — zero logging dep.
 trace = ["dep:tracing"]
