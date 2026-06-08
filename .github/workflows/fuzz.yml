@@ -28,7 +28,7 @@ jobs:
       - name: Seed corpus from committed images
         run: |
           mkdir -p "fuzz/corpus/${{ matrix.target }}"
-          cp vmdk/tests/data/*.vmdk "fuzz/corpus/${{ matrix.target }}/" 2>/dev/null || true
+          cp core/tests/data/*.vmdk "fuzz/corpus/${{ matrix.target }}/" 2>/dev/null || true
       - name: Fuzz ${{ matrix.target }} (10 min)
         run: cargo fuzz run "${{ matrix.target }}" -- -max_total_time=600 -rss_limit_mb=4096
       - name: Upload crash artifacts

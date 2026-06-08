@@ -52,7 +52,7 @@ Exercises the grain-lookup path against actual filesystem content rather than ze
 | Property | Value |
 |----------|-------|
 | Source | Generated locally |
-| Command | `qemu-img create -f vmdk vmdk/tests/data/minimal.vmdk 1M` |
+| Command | `qemu-img create -f vmdk core/tests/data/minimal.vmdk 1M` |
 | Subformat | `monolithicSparse` (v1) |
 | Virtual size | 1 MiB (1,048,576 bytes) |
 | Content | All-sparse (all grains unmapped → reads return zeros) |
@@ -67,7 +67,7 @@ GD/GT arithmetic and sparse-grain zero-fill).
 | Property | Value |
 |----------|-------|
 | Source | Generated locally |
-| Command | `qemu-img create -f vmdk -o subformat=streamOptimized vmdk/tests/data/stream_opt.vmdk 1M` |
+| Command | `qemu-img create -f vmdk -o subformat=streamOptimized core/tests/data/stream_opt.vmdk 1M` |
 | Subformat | `streamOptimized` (header version 3, `compress_algorithm = 1`) |
 | Virtual size | 1 MiB (1,048,576 bytes) |
 | Content | All-sparse; GD/GT layout identical to v1 (gd_offset=26, all GTEs=0) |
@@ -82,7 +82,7 @@ without attempting DEFLATE decompression.
 | Property | Value |
 |----------|-------|
 | Source | Generated locally |
-| Command | `qemu-img create -f vmdk -o subformat=twoGbMaxExtentFlat vmdk/tests/data/flat.vmdk 1M` |
+| Command | `qemu-img create -f vmdk -o subformat=twoGbMaxExtentFlat core/tests/data/flat.vmdk 1M` |
 | Subformat | `twoGbMaxExtentFlat` |
 | Descriptor | `flat.vmdk` (344 bytes, text only) |
 | Extent | `flat-f001.vmdk` (1 MiB, raw zeros) |
@@ -113,7 +113,7 @@ extent files fails loudly rather than silently succeeding with `virtual_disk_siz
 | Property | Value |
 |----------|-------|
 | Source | Generated locally |
-| Command | `qemu-img create -f vmdk -o subformat=monolithicFlat vmdk/tests/data/mono_flat.vmdk 1M` |
+| Command | `qemu-img create -f vmdk -o subformat=monolithicFlat core/tests/data/mono_flat.vmdk 1M` |
 | Subformat | `monolithicFlat` |
 | Descriptor | `mono_flat.vmdk` (345 bytes, text only) |
 | Extent | `mono_flat-flat.vmdk` (1 MiB, raw zeros) |
@@ -129,7 +129,7 @@ output to the sparse GD/GT path for an all-zero virtual disk.
 | Property | Value |
 |----------|-------|
 | Source | Generated locally |
-| Command | `qemu-img create -f vmdk -o subformat=twoGbMaxExtentSparse vmdk/tests/data/tw_sparse.vmdk 4M` |
+| Command | `qemu-img create -f vmdk -o subformat=twoGbMaxExtentSparse core/tests/data/tw_sparse.vmdk 4M` |
 | Subformat | `twoGbMaxExtentSparse` |
 | Descriptor | `tw_sparse.vmdk` (351 bytes, text only) |
 | Extent | `tw_sparse-s001.vmdk` (64 KiB, sparse) |
@@ -275,30 +275,30 @@ cmp /tmp/se/qemu.raw /tmp/se/mine.raw && echo "IDENTICAL"
 
 ```sh
 # Regenerate all qemu-img corpus files
-qemu-img create -f vmdk vmdk/tests/data/minimal.vmdk 1M
-qemu-img create -f vmdk -o subformat=streamOptimized vmdk/tests/data/stream_opt.vmdk 1M
-qemu-img create -f vmdk -o subformat=twoGbMaxExtentFlat vmdk/tests/data/flat.vmdk 1M
-qemu-img create -f vmdk -o subformat=monolithicFlat vmdk/tests/data/mono_flat.vmdk 1M
-qemu-img create -f vmdk -o subformat=twoGbMaxExtentSparse vmdk/tests/data/tw_sparse.vmdk 4M
+qemu-img create -f vmdk core/tests/data/minimal.vmdk 1M
+qemu-img create -f vmdk -o subformat=streamOptimized core/tests/data/stream_opt.vmdk 1M
+qemu-img create -f vmdk -o subformat=twoGbMaxExtentFlat core/tests/data/flat.vmdk 1M
+qemu-img create -f vmdk -o subformat=monolithicFlat core/tests/data/mono_flat.vmdk 1M
+qemu-img create -f vmdk -o subformat=twoGbMaxExtentSparse core/tests/data/tw_sparse.vmdk 4M
 
 # twoGbMaxExtentSparse with real pattern data (4 MiB, bytes i%256)
 python3 -c "import sys; sys.stdout.buffer.write(bytes(i%256 for i in range(4*1024*1024)))" \
   > /tmp/pat4m.raw
 qemu-img convert -f raw -O vmdk -o subformat=twoGbMaxExtentSparse \
-  /tmp/pat4m.raw vmdk/tests/data/tw_sparse_data.vmdk
+  /tmp/pat4m.raw core/tests/data/tw_sparse_data.vmdk
 rm /tmp/pat4m.raw
 
 # streamOptimized with compressed grain (64 KiB, bytes i%64)
 python3 -c "import sys; sys.stdout.buffer.write(bytes(i%64 for i in range(65536)))" \
   > /tmp/pat64k.raw
 qemu-img convert -f raw -O vmdk -o subformat=streamOptimized \
-  /tmp/pat64k.raw vmdk/tests/data/compressed_stream_opt.vmdk
+  /tmp/pat64k.raw core/tests/data/compressed_stream_opt.vmdk
 rm /tmp/pat64k.raw
 
 # Compute reference MD5s
 for f in dfvfs_ext2 minimal stream_opt plaso_image mono_flat \
           tw_sparse tw_sparse_data compressed_stream_opt; do
-  qemu-img convert -O raw vmdk/tests/data/$f.vmdk /tmp/ref_$f.raw
+  qemu-img convert -O raw core/tests/data/$f.vmdk /tmp/ref_$f.raw
   printf "%s  %s\n" "$(md5 -q /tmp/ref_$f.raw)" "$f.vmdk"
   rm /tmp/ref_$f.raw
 done

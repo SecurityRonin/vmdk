@@ -246,13 +246,6 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 [[package]]
 name = "forensicnomicon"
 version = "0.3.1"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "forensicnomicon"
-version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f66c898c0f3813cb476c7d1f9e78919566e753b8ce5d581ca8d0f364a55b04b5"
 dependencies = [
@@ -753,7 +746,7 @@ name = "vmdk-cli"
 version = "0.7.0"
 dependencies = [
  "clap",
- "forensicnomicon 0.3.1",
+ "forensicnomicon",
  "serde_json",
  "tempfile",
  "vmdk-core 0.6.3",
@@ -793,7 +786,7 @@ dependencies = [
 name = "vmdk-forensic"
 version = "0.6.1"
 dependencies = [
- "forensicnomicon 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "forensicnomicon",
  "serde",
  "vmdk-core 0.6.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]

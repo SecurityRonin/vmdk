@@ -1045,7 +1045,7 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("vmdk/tests/data")
+            .join("core/tests/data")
             .join(name)
     }
 

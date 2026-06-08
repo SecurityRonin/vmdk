@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vmdk", "vmdk-cli", "vmdk-forensic"]
+members = ["core", "forensic", "cli"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
