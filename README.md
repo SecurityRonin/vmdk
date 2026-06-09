@@ -1,12 +1,20 @@
-# vmdk
+# vmdk-forensic
 
-[![Crates.io](https://img.shields.io/crates/v/vmdk-core.svg)](https://crates.io/crates/vmdk)
+[![vmdk-core](https://img.shields.io/crates/v/vmdk-core.svg?label=vmdk-core)](https://crates.io/crates/vmdk-core)
+[![vmdk-forensic](https://img.shields.io/crates/v/vmdk-forensic.svg?label=vmdk-forensic)](https://crates.io/crates/vmdk-forensic)
 [![docs.rs](https://img.shields.io/docsrs/vmdk-core)](https://docs.rs/vmdk-core)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/SecurityRonin/vmdk-forensic/actions/workflows/ci.yml/badge.svg)](https://github.com/SecurityRonin/vmdk-forensic/actions)
 [![Sponsor](https://img.shields.io/badge/sponsor-h4x0r-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/h4x0r)
 
-Pure-Rust, read-only reader for VMware VMDK disk images. Presents the virtual disk as a plain `Read + Seek` byte stream — and, uniquely, **recovers data from a damaged disk through the redundant grain directory that `qemu-img` and `libvmdk` throw away**, while surfacing the forensic metadata they discard.
+**Read VMware VMDK disk images others give up on, then audit them for tampering.** Two crates in one workspace: the [`vmdk-core`](https://crates.io/crates/vmdk-core) reader (imported as `vmdk`) presents the virtual disk as a plain `Read + Seek` byte stream — and **recovers data from a damaged disk through the redundant grain directory that `qemu-img` and `libvmdk` throw away** — while the [`vmdk-forensic`](https://crates.io/crates/vmdk-forensic) analyzer turns the structure into severity-graded, evidence-grade findings.
+
+## The two crates
+
+| Crate | Role | Import | `cargo add` |
+|---|---|---|---|
+| [`vmdk-core`](https://crates.io/crates/vmdk-core) | Read-only VMDK reader: decoded virtual-sector `Read + Seek`, RGD-fallback recovery, `ddb` provenance | `use vmdk::…` | `cargo add vmdk-core` |
+| [`vmdk-forensic`](https://crates.io/crates/vmdk-forensic) | Integrity analyzer → canonical `forensicnomicon::report::Finding` (re-exports the reader) | `use vmdk_forensic::…` | `cargo add vmdk-forensic` |
 
 ## Command-line tool
 
@@ -61,9 +69,11 @@ Three more verbs cover extraction and comparison:
 
 ## Rust library
 
-```toml
-[dependencies]
-vmdk = "0.4"
+The reader is published as `vmdk-core` and imported as `vmdk`; the analyzer is `vmdk-forensic`:
+
+```bash
+cargo add vmdk-core       # the reader (imported as `vmdk`)
+cargo add vmdk-forensic   # the analyzer (re-exports the reader)
 ```
 
 ## Quick start
@@ -211,9 +221,9 @@ companion crate — see [Related](#related).
   value (512), matching QEMU, so a crafted header can't drive a multi-gigabyte
   grain-table allocation.
 - **Zero `unsafe`** — `unsafe_code = "forbid"` workspace-wide; no C dependency.
-- **Fuzz-tested** — three `cargo fuzz` targets cover the open path, the full
-  read/scan/integrity surface, and the RGD recovery paths; run in CI on every
-  change and deeper on a schedule.
+- **Fuzz-tested** — four `cargo fuzz` targets cover the open path, the full
+  read surface, the RGD recovery paths, and the forensic analysis pipeline; run
+  in CI on every change and deeper on a schedule.
 
 Hardened further in **0.6.0** (all on the untrusted-input path):
 
@@ -236,6 +246,7 @@ cargo install cargo-fuzz
 cargo +nightly fuzz run fuzz_open
 cargo +nightly fuzz run fuzz_read
 cargo +nightly fuzz run fuzz_recover
+cargo +nightly fuzz run fuzz_forensic
 ```
 
 ## Testing

@@ -1,6 +1,7 @@
 # vmdk-forensic
 
-[![Crates.io](https://img.shields.io/crates/v/vmdk-forensic.svg)](https://crates.io/crates/vmdk-forensic)
+[![vmdk-forensic](https://img.shields.io/crates/v/vmdk-forensic.svg?label=vmdk-forensic)](https://crates.io/crates/vmdk-forensic)
+[![vmdk-core](https://img.shields.io/crates/v/vmdk-core.svg?label=vmdk-core)](https://crates.io/crates/vmdk-core)
 [![docs.rs](https://img.shields.io/docsrs/vmdk-forensic)](https://docs.rs/vmdk-forensic)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/SecurityRonin/vmdk-forensic/actions/workflows/ci.yml/badge.svg)](https://github.com/SecurityRonin/vmdk-forensic/actions)
@@ -10,9 +11,8 @@ Forensic integrity analysis for VMware VMDK images. The evidence-grade layer on 
 
 ## Quick start
 
-```toml
-[dependencies]
-vmdk-forensic = "0.1"
+```bash
+cargo add vmdk-forensic
 ```
 
 ```rust
@@ -84,11 +84,19 @@ This is the same split as `vhdx`/`vhdx-forensic` and `ewf`/`ewf-forensic`:
   tamper/corruption detection, recovery triage, and provenance. It re-exports
   `vmdk::VmdkReader`, so one dependency covers read + analysis.
 
-## Security
+## Trust but verify
 
 Built to run on untrusted, potentially crafted images: every offset derived from a
 header field uses saturating arithmetic and is bounds-checked before any read or
-allocation; the grain-directory size is capped; zero `unsafe`.
+allocation; the grain-directory size is capped (16 MiB); zero `unsafe`
+(`unsafe_code = "forbid"` workspace-wide). The analysis pipeline has a dedicated
+`cargo fuzz` target (`fuzz_forensic`), and the underlying `vmdk-core` reader is
+cross-validated **byte-for-byte against `qemu-img convert -O raw`** on real
+COWD/seSparse images — so the analyzer and its fixtures don't share a blind spot.
+
+Findings are **observations, not legal conclusions** — MITRE ATT&CK references
+(e.g. T1565.001 on `VMDK-RGD-MISMATCH`) read "consistent with," and the analyst
+draws the conclusion.
 
 ---
 
